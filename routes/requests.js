@@ -2,10 +2,21 @@ const express = require('express');
 const router = express.Router();
 const { protect, authorize } = require('../middleware/auth');
 const Request = require('../models/Request');
+
+function sanitizeRequestAnswers(answers) {
+  const cleaned = { ...(answers || {}) };
+  if (cleaned.fullAddress && !cleaned.full_address) cleaned.full_address = cleaned.fullAddress;
+  if (cleaned.clientLocation && !cleaned.client_location) cleaned.client_location = cleaned.clientLocation;
+  if (cleaned.serviceLocationType && !cleaned.service_location_type) cleaned.service_location_type = cleaned.serviceLocationType;
+  delete cleaned.fullAddress;
+  delete cleaned.clientLocation;
+  delete cleaned.serviceLocationType;
+  return cleaned;
+}
 const Approach = require('../models/Approach');
 const { logAudit } = require('../utils/audit');
 
-const calculateCredits = (service, answers) => {
+const calculateCredits = (service, answers, defaultCredits) => {
   // ─── BASE CREDITS PER SERVICE ───────────────────────────
   // Change these numbers to adjust the default cost per service
   const base = {
@@ -17,7 +28,7 @@ const calculateCredits = (service, answers) => {
     development:  35    // App / Web Development
   };
 
-  let credits = base[service] || 20;
+  let credits = base[service] || defaultCredits || 20;
   if (!answers) return credits;
 
   // ─── ITR: bump based on income bracket & complexity ─────
@@ -78,6 +89,79 @@ const calculateCredits = (service, answers) => {
 
   return credits;
 };
+
+async function getRequestCredits(service, answers) {
+  try {
+    const ServiceCategory = require('../models/ServiceCategory');
+    const category = await ServiceCategory.findOne({ value: String(service || '').toLowerCase(), isActive: { $ne: false } })
+      .select('creditCost')
+      .lean();
+    if (category && category.creditCost) return category.creditCost;
+  } catch(e) {}
+
+  let defaultCredits = 20;
+  try {
+    const PlatformSettings = require('../models/PlatformSettings');
+    const settings = await PlatformSettings.findOne({ singleton: true }).lean();
+    if (settings && settings.defaultPostCredits) defaultCredits = settings.defaultPostCredits;
+  } catch(e) {}
+  return calculateCredits(service, answers, defaultCredits);
+}
+
+function getExpertServiceValues(expert) {
+  const profile = expert.profile || {};
+  const values = []
+    .concat(expert.servicesOffered || [])
+    .concat(profile.servicesOffered || [])
+    .concat(profile.expert_services || [])
+    .concat(profile.services || []);
+
+  return values
+    .map(v => String(v || '').trim().toLowerCase())
+    .filter(Boolean);
+}
+
+async function notifyExpertsAboutNewRequest(request) {
+  try {
+    const User = require('../models/User');
+    const ServiceCategory = require('../models/ServiceCategory');
+    const { sendExpertNewPost } = require('../utils/notificationEmailService');
+    const service = String(request.service || '').toLowerCase();
+    const category = await ServiceCategory.findOne({ value: service }).select('label searchAliases').lean();
+    const serviceMatches = [service];
+    if (category && category.label) serviceMatches.push(String(category.label).toLowerCase());
+    if (category && category.searchAliases) {
+      category.searchAliases.split(',').forEach(alias => {
+        const value = alias.trim().toLowerCase();
+        if (value) serviceMatches.push(value);
+      });
+    }
+    const experts = await User.find({
+      role: 'expert',
+      emailVerified: true,
+      isBanned: { $ne: true },
+      isRestricted: { $ne: true },
+      isActive: { $ne: false }
+    }).select('name email servicesOffered profile preferences').lean();
+
+    experts.forEach(expert => {
+      const preferredServices = getExpertServiceValues(expert);
+      const matchesService = preferredServices.length === 0 || preferredServices.some(value => serviceMatches.indexOf(value) !== -1);
+      if (!matchesService) return;
+      sendExpertNewPost({
+        to: expert.email,
+        name: expert.name,
+        postTitle: request.title,
+        service: request.service,
+        credits: request.credits,
+        location: request.location,
+        userId: expert._id
+      }).catch(() => {});
+    });
+  } catch(e) {
+    console.error('New post expert notification error:', e.message);
+  }
+}
 // ─── GET AVAILABLE REQUESTS FOR EXPERTS (NOT YET APPROACHED) ───
 router.get('/available', protect, authorize('expert'), async (req, res) => {
   try {
@@ -174,6 +258,7 @@ router.get('/available', protect, authorize('expert'), async (req, res) => {
 router.post('/', protect, authorize('client'), async (req, res) => {
   try {
     const { service, title, description, answers, timeline, budget, location } = req.body;
+    const cleanAnswers = sanitizeRequestAnswers(answers);
     
     console.log('📝 Creating request:');
     console.log('  Client:', req.user.id);
@@ -182,7 +267,7 @@ router.post('/', protect, authorize('client'), async (req, res) => {
     console.log('  Timeline:', timeline);
     console.log('  Budget:', budget);
     console.log('  Location:', location);
-    console.log('  Answers keys:', answers ? Object.keys(answers).join(', ') : 'none');
+    console.log('  Answers keys:', cleanAnswers ? Object.keys(cleanAnswers).join(', ') : 'none');
     
     // Validate required fields
     if (!service) {
@@ -218,7 +303,7 @@ router.post('/', protect, authorize('client'), async (req, res) => {
     }
     
     // Calculate credits
-    const credits = calculateCredits(service, answers);
+    const credits = await getRequestCredits(service, cleanAnswers);
     console.log('  💰 Calculated credits:', credits);
     
     // Create request
@@ -227,7 +312,7 @@ router.post('/', protect, authorize('client'), async (req, res) => {
       service,
       title,
       description,
-      answers: answers || {},
+      answers: cleanAnswers,
       timeline: timeline || 'flexible',
       budget: budget || '0',
       location,
@@ -250,6 +335,8 @@ router.post('/', protect, authorize('client'), async (req, res) => {
         postTitle: title, service: service, userId: req.user._id
       }).catch(() => {});
     } catch(e) {}
+
+    notifyExpertsAboutNewRequest(request).catch(() => {});
 
  // ── Audit: request_created ──
     logAudit(

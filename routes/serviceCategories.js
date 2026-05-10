@@ -15,8 +15,11 @@
 const express  = require('express');
 const router   = express.Router();
 const jwt      = require('jsonwebtoken');
+const fs       = require('fs');
+const path     = require('path');
 const Admin    = require('../models/Admin');
 const ServiceCategory = require('../models/ServiceCategory');
+const PlatformSettings = require('../models/PlatformSettings');
  
 // ── Reuse admin protect middleware ──────────────────────────
 const protect = async (req, res, next) => {
@@ -238,7 +241,7 @@ function buildCommonSection(commonCat) {
       };
     } else if (q.id === 'client_location') {
       built.type = 'address';
-      built.key  = 'clientLocation';
+      built.key  = 'client_location';
       built.fields = {
         pincode: { label: 'Pincode', placeholder: 'e.g. 560095',    required: true, autoFillTrigger: true },
         city:    { label: 'City',    placeholder: 'e.g. Bengaluru', required: true, autoFilled: true },
@@ -491,6 +494,10 @@ async function pushServicesConfig(content) {
 async function syncToGitHub() {
   const categories = await ServiceCategory.find({}).sort({ sortOrder: 1, createdAt: 1 });
   const content = generateServicesConfig(categories);
+  const localFrontendConfig = path.resolve(__dirname, '../../workindex-frontend/services-config.js');
+  if (fs.existsSync(localFrontendConfig)) {
+    fs.writeFileSync(localFrontendConfig, content, 'utf8');
+  }
   await pushServicesConfig(content);
   return content;
 }
@@ -516,6 +523,54 @@ router.get('/preview/config', protect, async (req, res) => {
     const categories = await ServiceCategory.find({}).sort({ sortOrder: 1 });
     const content = generateServicesConfig(categories);
     res.json({ success: true, content });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// GET marketplace credit settings for the service category admin tab.
+router.get('/settings/platform', protect, async (req, res) => {
+  try {
+    let settings = await PlatformSettings.findOne({ singleton: true });
+    if (!settings) settings = await PlatformSettings.create({ singleton: true });
+    res.json({ success: true, settings });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// UPDATE credit packs and default post credits used by request fallback pricing.
+router.put('/settings/platform', protect, superOnly, async (req, res) => {
+  try {
+    const updates = {};
+    if (req.body.defaultPostCredits !== undefined) {
+      const defaultPostCredits = parseInt(req.body.defaultPostCredits, 10);
+      if (!defaultPostCredits || defaultPostCredits < 1) {
+        return res.status(400).json({ success: false, message: 'Default post credits must be at least 1' });
+      }
+      updates.defaultPostCredits = defaultPostCredits;
+    }
+    if (Array.isArray(req.body.creditPacks)) {
+      updates.creditPacks = req.body.creditPacks
+        .map(p => ({
+          id: String(p.id || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '_'),
+          label: String(p.label || p.id || '').trim(),
+          credits: parseInt(p.credits, 10) || 0,
+          price: parseInt(p.price, 10) || 0,
+          active: p.active !== false
+        }))
+        .filter(p => p.id && p.label && p.credits > 0 && p.price > 0);
+      if (!updates.creditPacks.length) {
+        return res.status(400).json({ success: false, message: 'At least one valid credit pack is required' });
+      }
+    }
+
+    const settings = await PlatformSettings.findOneAndUpdate(
+      { singleton: true },
+      { $set: updates },
+      { new: true, upsert: true, runValidators: true }
+    );
+    res.json({ success: true, message: 'Platform credit settings updated', settings });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -801,7 +856,6 @@ router.post('/seed-common', protect, superOnly, async (req, res) => {
         {
           id: 'client_location', question: 'Where are you based?', type: 'address', required: true,
           subtitle: 'Helps match you with professionals in your region',
-          alias: 'clientLocation',
           addressFields: {
             pincode: { label: 'Pincode', placeholder: 'e.g. 560095',    required: true, autoFillTrigger: true },
             city:    { label: 'City',    placeholder: 'e.g. Bengaluru', required: true, autoFilled: true },

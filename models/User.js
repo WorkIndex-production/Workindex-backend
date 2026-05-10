@@ -225,7 +225,8 @@ const userSchema = new mongoose.Schema({
     },
     notifications: {
       email: { type: Boolean, default: true },
-      sms:   { type: Boolean, default: false }
+      sms:   { type: Boolean, default: false },
+      newPosts: { type: Boolean, default: true }
     }
   },
 

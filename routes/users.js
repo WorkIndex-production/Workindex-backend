@@ -8,6 +8,56 @@ const User = require('../models/User');
 const Rating = require('../models/Rating');
 const { logAudit } = require('../utils/audit');
 
+function normalizeForAudit(value) {
+  if (value === undefined || value === null) return '';
+  if (Array.isArray(value) || typeof value === 'object') return JSON.stringify(value);
+  return String(value);
+}
+
+function auditFieldLabel(key) {
+  const labels = {
+    bio: 'bio',
+    expert_bio: 'bio',
+    specialization: 'specialization',
+    expert_specialization: 'specialization',
+    whyChooseMe: 'why choose me',
+    city: 'city',
+    expert_city: 'city',
+    state: 'state',
+    expert_state: 'state',
+    pincode: 'pincode',
+    expert_pincode: 'pincode',
+    gstNumber: 'GST number',
+    licenseNumber: 'professional license',
+    certificationNumber: 'certification number',
+    education: 'education',
+    portfolio: 'portfolio',
+    professionalAddress: 'professional address',
+    servicesOffered: 'services offered',
+    serviceLocationType: 'service location',
+    fullAddress: 'full address',
+    clientLocation: 'client location',
+    phone: 'phone'
+  };
+  return labels[key] || String(key).replace(/^expert_/, '').replace(/_/g, ' ').replace(/([A-Z])/g, ' $1').trim();
+}
+
+function auditActionForProfileField(key) {
+  return 'profile_' + auditFieldLabel(key).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '') + '_updated';
+}
+
+function getChangedProfileFields(previousUser, nextProfile, topLevelUpdate) {
+  const previousProfile = (previousUser && previousUser.profile) || {};
+  const changed = [];
+  Object.keys(nextProfile || {}).forEach(key => {
+    if (normalizeForAudit(previousProfile[key]) !== normalizeForAudit(nextProfile[key])) changed.push(key);
+  });
+  Object.keys(topLevelUpdate || {}).forEach(key => {
+    if (normalizeForAudit(previousUser && previousUser[key]) !== normalizeForAudit(topLevelUpdate[key])) changed.push(key);
+  });
+  return changed;
+}
+
 // ─── PHONE VALIDATION ───────────────────────────────────────────────────────
 const WHITELISTED_IPS = [
   '127.0.0.1',
@@ -238,7 +288,13 @@ router.put('/preferences', protect, async (req, res) => {
     
     const updateData = {};
     if (darkMode !== undefined) updateData['preferences.darkMode'] = darkMode;
-    if (notifications) updateData['preferences.notifications'] = notifications;
+    if (notifications) {
+      Object.keys(notifications).forEach(function(key) {
+        if (['email', 'sms', 'newPosts'].indexOf(key) !== -1) {
+          updateData['preferences.notifications.' + key] = !!notifications[key];
+        }
+      });
+    }
     
     const user = await User.findByIdAndUpdate(
       req.user.id,
@@ -394,6 +450,7 @@ router.post('/portfolio', protect, authorize('expert'), upload.single('image'), 
 router.put('/profile', protect, async (req, res) => {
   try {
     const profile = req.body.profile || {};
+    const previousUser = await User.findById(req.user.id).select('profile whyChooseMe phone name role').lean();
 
     // Build location update from all possible sources
     const locationUpdate = {};
@@ -438,12 +495,16 @@ router.put('/profile', protect, async (req, res) => {
     ).select('-password');
 
 try {
-  logAudit(
-    { id: req.user._id, role: req.user.role, name: req.user.name },
-    'profile_updated',
-    { type: 'user', id: req.user._id, name: req.user.name },
-    { updatedFields: Object.keys(profile) }
-  ).catch(() => {});
+  const changedFields = getChangedProfileFields(previousUser, profile, topLevelUpdate);
+  const fieldsToLog = changedFields.length ? changedFields : Object.keys(profile);
+  fieldsToLog.forEach(field => {
+    logAudit(
+      { id: req.user._id, role: req.user.role, name: req.user.name },
+      auditActionForProfileField(field),
+      { type: 'user', id: req.user._id, name: req.user.name },
+      { field, label: auditFieldLabel(field), updatedFields: changedFields }
+    ).catch(() => {});
+  });
 } catch(e) {}
     
     res.json({
@@ -480,6 +541,57 @@ router.post('/qualifications', protect, authorize('expert'), async (req, res) =>
   } catch (error) {
     console.error('Add qualification error:', error);
     res.status(500).json({ success: false, message: 'Error adding qualification' });
+  }
+});
+
+router.get('/location-suggestions', async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim();
+    const regex = q ? new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') : null;
+    const experts = await User.find({
+      role: 'expert',
+      $or: regex ? [
+        { 'location.city': regex },
+        { 'location.pincode': regex },
+        { 'profile.city': regex },
+        { 'profile.pincode': regex },
+        { 'profile.expert_city': regex },
+        { 'profile.expert_pincode': regex }
+      ] : [
+        { 'location.city': { $exists: true, $ne: '' } },
+        { 'location.pincode': { $exists: true, $ne: '' } },
+        { 'profile.city': { $exists: true, $ne: '' } },
+        { 'profile.pincode': { $exists: true, $ne: '' } },
+        { 'profile.expert_city': { $exists: true, $ne: '' } },
+        { 'profile.expert_pincode': { $exists: true, $ne: '' } }
+      ]
+    }).select('location profile').limit(80).lean();
+
+    const seen = new Set();
+    const suggestions = [];
+    experts.forEach(expert => {
+      const city = expert.location?.city || expert.profile?.city || expert.profile?.expert_city || '';
+      const pin = expert.location?.pincode || expert.profile?.pincode || expert.profile?.expert_pincode || '';
+      if (city) {
+        const key = 'city:' + city.toLowerCase();
+        if (!seen.has(key)) {
+          seen.add(key);
+          suggestions.push({ type: 'city', label: city, value: city });
+        }
+      }
+      if (pin) {
+        const key = 'pincode:' + pin;
+        if (!seen.has(key)) {
+          seen.add(key);
+          suggestions.push({ type: 'pincode', label: pin + (city ? ' - ' + city : ''), value: pin });
+        }
+      }
+    });
+
+    res.json({ success: true, suggestions: suggestions.slice(0, 12) });
+  } catch (error) {
+    console.error('Location suggestions error:', error);
+    res.status(500).json({ success: false, suggestions: [] });
   }
 });
 

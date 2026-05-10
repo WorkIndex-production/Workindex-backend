@@ -78,6 +78,22 @@ async function isEmailEnabledForUser(userId) {
     return true; // fail open — better to send than miss
   }
 }
+
+async function isNewPostEmailEnabledForUser(userId) {
+  try {
+    if (!userId) return true;
+    const mongoose = require('mongoose');
+    const User = mongoose.model('User');
+    const user = await User.findById(userId).select('preferences').lean();
+    if (!user) return true;
+    const notifPrefs = user.preferences && user.preferences.notifications;
+    if (notifPrefs && notifPrefs.email === false) return false;
+    if (notifPrefs && notifPrefs.newPosts === false) return false;
+    return true;
+  } catch(e) {
+    return true;
+  }
+}
 // ─── SETTINGS CHECK ───────────────────────────────────────
 async function isEnabled(type) {
   try {
@@ -387,6 +403,43 @@ async function sendExpertApproachSubmitted({ to, name, postTitle, clientName, cr
   await logEmail({ to, toName: name, subject: `Approach submitted: ${postTitle}`, type, category: 'expert', reason: `Expert approached request "${postTitle}"`, status: result.success ? 'sent' : 'failed', error: result.error || '', userId });
 }
 
+// 10b. Expert: New matching client request posted
+async function sendExpertNewPost({ to, name, postTitle, service, credits, location, userId }) {
+  const type = 'expert_new_post';
+  if (!await isEnabled(type)) return;
+  if (!await isNewPostEmailEnabledForUser(userId)) return;
+
+  const html = layout('New client request matching your services', `
+    ${para(`Hi <strong>${name}</strong>,`)}
+    ${para(`A new client request has been posted on WorkIndex that matches your preferred services.`)}
+    ${infoBox(`<strong>Request Details:</strong><br>
+      <strong>Title:</strong> ${postTitle}<br>
+      <strong>Service:</strong> ${service}<br>
+      <strong>Location:</strong> ${location || 'Not specified'}<br>
+      <strong>Credits to approach:</strong> ${credits || 20}`)}
+    ${para(`Log in to review the full requirement and send your approach if it is a good fit.`)}
+    ${ctaButton('View New Requests', 'https://workindex-frontend.vercel.app')}
+  `);
+
+  const result = await sendViaBrevo({
+    to,
+    toName: name,
+    subject: `New WorkIndex request: ${postTitle}`,
+    htmlContent: html
+  });
+  await logEmail({
+    to,
+    toName: name,
+    subject: `New post: ${postTitle}`,
+    type,
+    category: 'expert',
+    reason: `New client request posted for ${service}`,
+    status: result.success ? 'sent' : 'failed',
+    error: result.error || '',
+    userId
+  });
+}
+
 // 11. Expert: Account Restricted
 async function sendExpertRestricted({ to, name, reason, warningCount, userId }) {
   const type = 'expert_restricted';
@@ -622,6 +675,7 @@ module.exports = {
   sendExpertCreditsPurchased,
   sendExpertCreditsRefunded,
   sendExpertApproachSubmitted,
+  sendExpertNewPost,
   sendExpertRestricted,
   sendExpertBanned,
   sendAdminPostSuspended,

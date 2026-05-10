@@ -21,12 +21,25 @@ const BACKEND_URL  = process.env.BACKEND_URL  || 'https://workindex-production.u
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://workindex.co.in';
 
 // Credit packs — must match credits.js
-const CREDIT_PACKS = [
-  { id: 'starter', credits: 15,  price: 100  },
-  { id: 'basic',   credits: 40,  price: 250  },
-  { id: 'popular', credits: 180, price: 1000 },
-  { id: 'pro',     credits: 500, price: 2500 },
+const DEFAULT_CREDIT_PACKS = [
+  { id: 'starter', label: 'Starter', credits: 15,  price: 100,  active: true },
+  { id: 'basic',   label: 'Basic',   credits: 40,  price: 250,  active: true },
+  { id: 'popular', label: 'Popular', credits: 180, price: 1000, active: true },
+  { id: 'pro',     label: 'Pro',     credits: 500, price: 2500, active: true },
 ];
+
+async function getCreditPacks() {
+  try {
+    const PlatformSettings = require('../models/PlatformSettings');
+    const settings = await PlatformSettings.findOne({ singleton: true }).lean();
+    const packs = settings && settings.creditPacks && settings.creditPacks.length
+      ? settings.creditPacks
+      : DEFAULT_CREDIT_PACKS;
+    return packs.filter(p => p.active !== false);
+  } catch(e) {
+    return DEFAULT_CREDIT_PACKS;
+  }
+}
 
 // ═══════════════════════════════════════════════════════════
 // HELPER — Instamojo headers
@@ -69,7 +82,8 @@ router.post('/create-order', protect, authorize('expert'), async (req, res) => {
   try {
     const { packId } = req.body;
 
-    const pack = CREDIT_PACKS.find(p => p.id === packId);
+    const creditPacks = await getCreditPacks();
+    const pack = creditPacks.find(p => p.id === packId);
     if (!pack) {
       return res.status(400).json({ success: false, message: 'Invalid pack selected' });
     }

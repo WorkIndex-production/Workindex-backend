@@ -6,6 +6,33 @@ const Request = require('../models/Request');
 const User = require('../models/User');
 const { logAudit } = require('../utils/audit');
 
+function calculateProfileStrength(user) {
+  const profile = user.profile || {};
+  let total = 0;
+  const bio = profile.bio || profile.expert_bio || user.bio || '';
+  const specialization = profile.specialization || profile.expert_specialization || user.specialization || '';
+  const city = profile.city || profile.expert_city || user.location?.city || '';
+  const pincode = profile.pincode || profile.expert_pincode || user.location?.pincode || '';
+
+  if (user.profilePhoto) total += 10;
+  if (bio && bio.length >= 30) total += 10;
+  if (specialization) total += 10;
+  if (city && pincode) total += 10;
+
+  ['gstNumber', 'licenseNumber', 'certificationNumber', 'education', 'portfolio'].forEach(key => {
+    const val = profile[key];
+    if (val && (typeof val !== 'string' || val.trim())) total += 8;
+  });
+
+  if ((user.reviewCount || 0) >= 1) total += 5;
+  if ((user.totalApproaches || 0) >= 1) total += 5;
+  const responseRate = user.responseRate || 0;
+  if (responseRate >= 80) total += 10;
+  else if (responseRate >= 50) total += 5;
+
+  return total;
+}
+
 // ─── CREATE NEW APPROACH (EXPERT ONLY) ───
 router.post('/', protect, authorize('expert'), async (req, res) => {
   try {
@@ -54,8 +81,19 @@ router.post('/', protect, authorize('expert'), async (req, res) => {
       });
     }
     
-    // Check expert has enough credits
+    // Check expert profile strength before allowing paid approaches
     const expert = await User.findById(req.user.id);
+    const profileStrength = calculateProfileStrength(expert);
+    if (profileStrength < 50) {
+      return res.status(400).json({
+        success: false,
+        code: 'PROFILE_STRENGTH_REQUIRED',
+        profileStrength,
+        message: 'Complete at least 50% of your profile before approaching clients.'
+      });
+    }
+
+    // Check expert has enough credits
     const creditsRequired = request.credits || 20;
     
     console.log('  Credits required:', creditsRequired);

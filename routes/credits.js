@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const { protect, authorize } = require('../middleware/auth');
 const User = require('../models/User');
 const Transaction = require('../models/Transaction');
+const PlatformSettings = require('../models/PlatformSettings');
 
 // ⭐ NEW: Razorpay instance — reads keys from Railway environment variables
 const Razorpay = require('razorpay');
@@ -48,6 +49,33 @@ const CREDIT_PACKS = [
   }
 ];
 
+async function getCreditPacks() {
+  try {
+    const settings = await PlatformSettings.findOne({ singleton: true }).lean();
+    const packs = settings && settings.creditPacks && settings.creditPacks.length
+      ? settings.creditPacks
+      : CREDIT_PACKS;
+    return packs
+      .filter(p => p.active !== false)
+      .map(p => {
+        const credits = parseInt(p.credits, 10) || 0;
+        const price = parseInt(p.price, 10) || 0;
+        return {
+          id: p.id,
+          label: p.label || p.id,
+          credits,
+          price,
+          pricePerCredit: credits ? +(price / credits).toFixed(2) : 0,
+          savings: p.savings || 0,
+          popular: p.popular || p.id === 'popular',
+          active: p.active !== false
+        };
+      });
+  } catch(e) {
+    return CREDIT_PACKS;
+  }
+}
+
 // Get credit balance
 router.get('/balance', protect, authorize('expert'), async (req, res) => {
   try {
@@ -66,10 +94,11 @@ router.get('/balance', protect, authorize('expert'), async (req, res) => {
 });
 
 // Get available credit packs
-router.get('/packs', (req, res) => {
+router.get('/packs', async (req, res) => {
+  const packs = await getCreditPacks();
   res.json({ 
     success: true, 
-    packs: CREDIT_PACKS 
+    packs
   });
 });
 
@@ -119,7 +148,8 @@ router.post('/purchase/initiate', protect, authorize('expert'), async (req, res)
   try {
     const { packId } = req.body;
 
-    const pack = CREDIT_PACKS.find(p => p.id === packId);
+    const creditPacks = await getCreditPacks();
+    const pack = creditPacks.find(p => p.id === packId);
     if (!pack) {
       return res.status(400).json({ success: false, message: 'Invalid pack selected' });
     }

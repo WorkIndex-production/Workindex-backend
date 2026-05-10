@@ -3,6 +3,22 @@ const router  = express.Router();
 const Visit   = require('../models/Visit');
 const jwt     = require('jsonwebtoken');
 
+function normalizeTrafficSource(value, referrer) {
+  const raw = String(value || '').trim().toLowerCase();
+  const ref = String(referrer || '').trim().toLowerCase();
+  const combined = raw || ref;
+  if (!combined) return 'Direct';
+  if (/instagram|ig/.test(combined)) return 'Instagram';
+  if (/facebook|fb\.|meta/.test(combined)) return 'Facebook';
+  if (/google/.test(combined)) return 'Google';
+  if (/linkedin/.test(combined)) return 'LinkedIn';
+  if (/whatsapp|wa\.me/.test(combined)) return 'WhatsApp';
+  if (/twitter|x\.com|t\.co/.test(combined)) return 'Twitter/X';
+  if (/youtube|youtu\.be/.test(combined)) return 'YouTube';
+  if (/bing/.test(combined)) return 'Bing';
+  return raw ? raw.replace(/[_-]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase()) : 'Other';
+}
+
 // ─── Admin auth — checks isAdmin: true (matches admin login JWT) ─────────────
 function adminAuth(req, res, next) {
   try {
@@ -30,6 +46,9 @@ function adminAuth(req, res, next) {
 router.post('/track', async (req, res) => {
   try {
     const { page = '/', sessionId = '' } = req.body;
+    const referrer = req.body.referrer || req.headers['referer'] || '';
+    const source = normalizeTrafficSource(req.body.source || req.body.utm_source, referrer);
+    const medium = req.body.medium || req.body.utm_medium || '';
 
     const ip =
       req.headers['cf-connecting-ip'] ||
@@ -74,7 +93,9 @@ router.post('/track', async (req, res) => {
     await Visit.create({
       ip, country, state, city, page, sessionId,
       userAgent: req.headers['user-agent'] || '',
-      referrer:  req.body.referrer || req.headers['referer'] || ''
+      referrer,
+      source,
+      medium
     });
     res.json({ success: true });
   } catch (error) {
@@ -181,15 +202,31 @@ router.get('/stats', adminAuth, async (req, res) => {
             source: {
               $switch: {
                 branches: [
+                  { case: { $regexMatch: { input: { $ifNull: ['$source', ''] }, regex: /instagram/i } }, then: 'Instagram' },
+                  { case: { $regexMatch: { input: { $ifNull: ['$source', ''] }, regex: /facebook/i } }, then: 'Facebook' },
+                  { case: { $regexMatch: { input: { $ifNull: ['$source', ''] }, regex: /google/i } }, then: 'Google' },
+                  { case: { $regexMatch: { input: { $ifNull: ['$source', ''] }, regex: /linkedin/i } }, then: 'LinkedIn' },
+                  { case: { $regexMatch: { input: { $ifNull: ['$source', ''] }, regex: /whatsapp/i } }, then: 'WhatsApp' },
+                  { case: { $regexMatch: { input: { $ifNull: ['$source', ''] }, regex: /twitter|x/i } }, then: 'Twitter/X' },
+                  { case: { $regexMatch: { input: { $ifNull: ['$source', ''] }, regex: /youtube|youtu\.be/i } }, then: 'YouTube' },
+                  { case: { $regexMatch: { input: { $ifNull: ['$source', ''] }, regex: /bing/i } }, then: 'Bing' },
                   { case: { $regexMatch: { input: { $ifNull: ['$referrer', ''] }, regex: /google/i } }, then: 'Google' },
                   { case: { $regexMatch: { input: { $ifNull: ['$referrer', ''] }, regex: /facebook|fb\./i } }, then: 'Facebook' },
                   { case: { $regexMatch: { input: { $ifNull: ['$referrer', ''] }, regex: /instagram/i } }, then: 'Instagram' },
-                  { case: { $regexMatch: { input: { $ifNull: ['$referrer', ''] }, regex: /twitter|x\.com/i } }, then: 'Twitter/X' },
+                  { case: { $regexMatch: { input: { $ifNull: ['$referrer', ''] }, regex: /twitter|x\.com|t\.co/i } }, then: 'Twitter/X' },
                   { case: { $regexMatch: { input: { $ifNull: ['$referrer', ''] }, regex: /linkedin/i } }, then: 'LinkedIn' },
-                  { case: { $regexMatch: { input: { $ifNull: ['$referrer', ''] }, regex: /whatsapp/i } }, then: 'WhatsApp' },
-                  { case: { $or: [{ $eq: ['$referrer', ''] }, { $eq: ['$referrer', null] }] }, then: 'Direct' }
+                  { case: { $regexMatch: { input: { $ifNull: ['$referrer', ''] }, regex: /whatsapp|wa\.me/i } }, then: 'WhatsApp' },
+                  { case: { $regexMatch: { input: { $ifNull: ['$referrer', ''] }, regex: /youtube|youtu\.be/i } }, then: 'YouTube' },
+                  { case: { $regexMatch: { input: { $ifNull: ['$referrer', ''] }, regex: /bing/i } }, then: 'Bing' },
+                  { case: { $or: [{ $eq: ['$source', 'Direct'] }, { $eq: ['$referrer', ''] }, { $eq: ['$referrer', null] }] }, then: 'Direct' }
                 ],
-                default: 'Other'
+                default: {
+                  $cond: [
+                    { $and: [{ $ne: ['$source', ''] }, { $ne: ['$source', null] }] },
+                    '$source',
+                    'Other'
+                  ]
+                }
               }
             }
           }

@@ -18,6 +18,7 @@ const emailSettingsSchema = new mongoose.Schema({
   expert_credits_purchased: { type: Boolean, default: true },
   expert_credits_refunded:  { type: Boolean, default: true },
   expert_approach_sent:     { type: Boolean, default: true },
+  expert_new_post:          { type: Boolean, default: true },
   expert_restricted:        { type: Boolean, default: true },
   expert_banned:            { type: Boolean, default: true },
 

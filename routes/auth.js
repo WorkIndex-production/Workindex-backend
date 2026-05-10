@@ -233,9 +233,7 @@ router.post('/login', [
     if (role && user.role !== role) {
       return res.status(401).json({
         success: false,
-        message: user.role === 'expert'
-          ? 'This is an expert account. Please use the Professional login.'
-          : 'This is a client account. Please use the Customer login.'
+        message: 'Invalid credentials'
       });
     }
 

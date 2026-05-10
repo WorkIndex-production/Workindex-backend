@@ -14,7 +14,8 @@ const requestSchema = new mongoose.Schema({
   service: {
     type: String,
     required: [true, 'Service is required'],
-    enum: ['itr', 'gst', 'accounting', 'audit', 'photography', 'development']
+    lowercase: true,
+    trim: true
   },
   category: String,
   description: {

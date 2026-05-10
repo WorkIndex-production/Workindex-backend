@@ -53,6 +53,17 @@ function safeModel(name) {
   try { return mongoose.models[name] || null; } catch(e) { return null; }
 }
 
+function sanitizeRequestAnswers(answers) {
+  var cleaned = Object.assign({}, answers || {});
+  if (cleaned.fullAddress && !cleaned.full_address) cleaned.full_address = cleaned.fullAddress;
+  if (cleaned.clientLocation && !cleaned.client_location) cleaned.client_location = cleaned.clientLocation;
+  if (cleaned.serviceLocationType && !cleaned.service_location_type) cleaned.service_location_type = cleaned.serviceLocationType;
+  delete cleaned.fullAddress;
+  delete cleaned.clientLocation;
+  delete cleaned.serviceLocationType;
+  return cleaned;
+}
+
 function safeReq(path) {
   try { return require(path); } catch(e) { return null; }
 }
@@ -902,13 +913,17 @@ router.get('/requests/:id', protect, async (req, res) => {
 router.put('/requests/:id', protect, cp('requests','write'), async (req, res) => {
   try {
     var Request = mongoose.model('Request');
-    var { title, description, status, creditsRequired } = req.body;
+    var { title, description, status, creditsRequired, answers, timeline, budget, location } = req.body;
     // Only update fields that were explicitly sent ? prevents accidental status override
     var updateFields = {};
     if (title       !== undefined) updateFields.title           = title;
     if (description !== undefined) updateFields.description     = description;
     if (status      !== undefined && status !== '') updateFields.status = status;
-        if (creditsRequired !== undefined && creditsRequired !== null) updateFields.credits = parseInt(creditsRequired) || 0;
+    if (creditsRequired !== undefined && creditsRequired !== null) updateFields.credits = parseInt(creditsRequired) || 0;
+    if (answers     !== undefined && answers !== null) updateFields.answers = sanitizeRequestAnswers(answers);
+    if (timeline    !== undefined && timeline !== '') updateFields.timeline = timeline;
+    if (budget      !== undefined) updateFields.budget = budget;
+    if (location    !== undefined && location !== '') updateFields.location = location;
     var request = await Request.findByIdAndUpdate(
   req.params.id,
   { $set: updateFields },
@@ -1732,8 +1747,8 @@ router.put('/email-settings', protect, async (req, res) => {
       'client_welcome','client_post_created','client_expert_approached',
       'client_post_suspended','client_restricted','client_banned',
       'expert_welcome','expert_credits_purchased','expert_credits_refunded',
-      'expert_approach_sent','expert_restricted','expert_banned',
-      'admin_post_suspended','admin_user_restricted','admin_daily_tickets'
+      'expert_approach_sent','expert_new_post','expert_restricted','expert_banned',
+      'admin_post_suspended','admin_user_restricted','admin_ticket_escalated','admin_daily_tickets'
     ];
     const safe = {};
     allowed.forEach(k => { if (k in updates) safe[k] = !!updates[k]; });

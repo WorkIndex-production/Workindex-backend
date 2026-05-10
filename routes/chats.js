@@ -26,8 +26,11 @@ router.get('/', protect, async (req, res) => {
 
 // Direct chat between expert and client (no request needed - for customer interest unlocks)
 router.post('/direct', protect, async (req, res) => {
+  let expertId;
+  let clientId;
   try {
-    const { expertId, clientId } = req.body;
+    expertId = req.body.expertId;
+    clientId = req.body.clientId;
     if (!expertId || !clientId) {
       return res.status(400).json({ success: false, message: 'expertId and clientId required' });
     }
