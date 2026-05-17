@@ -1,12 +1,12 @@
 const express = require('express');
 const router = express.Router();
-const { protect } = require('../middleware/auth');
+const { protect, authorize, blockRestrictedUser } = require('../middleware/auth');
 const AccessRequest = require('../models/AccessRequest');
 const Document = require('../models/Document');
 const Approach = require('../models/Approach');
 
 // ⭐ Request access to a document
-router.post('/', protect, async (req, res) => {
+router.post('/', protect, authorize('expert'), blockRestrictedUser, async (req, res) => {
   try {
     const { documentId, approachId, message } = req.body;
     
@@ -88,7 +88,7 @@ router.post('/', protect, async (req, res) => {
 });
 
 // ⭐ Get my access requests (for experts)
-router.get('/my-requests', protect, async (req, res) => {
+router.get('/my-requests', protect, authorize('expert'), async (req, res) => {
   try {
     const { status } = req.query;
     
@@ -118,7 +118,7 @@ router.get('/my-requests', protect, async (req, res) => {
 });
 
 // ⭐ Get access requests for my documents (for clients)
-router.get('/pending', protect, async (req, res) => {
+router.get('/pending', protect, authorize('client'), async (req, res) => {
   try {
     const requests = await AccessRequest.find({ 
       client: req.user.id,
@@ -146,7 +146,7 @@ router.get('/pending', protect, async (req, res) => {
 });
 
 // ⭐ Approve access request
-router.post('/:id/approve', protect, async (req, res) => {
+router.post('/:id/approve', protect, blockRestrictedUser, async (req, res) => {
   try {
     const { responseMessage } = req.body;
     
@@ -217,7 +217,7 @@ router.post('/:id/approve', protect, async (req, res) => {
 });
 
 // ⭐ Reject access request
-router.post('/:id/reject', protect, async (req, res) => {
+router.post('/:id/reject', protect, blockRestrictedUser, async (req, res) => {
   try {
     const { responseMessage } = req.body;
     
@@ -306,7 +306,7 @@ router.get('/:id', protect, async (req, res) => {
 });
 
 // ⭐ Delete/cancel access request
-router.delete('/:id', protect, async (req, res) => {
+router.delete('/:id', protect, blockRestrictedUser, async (req, res) => {
   try {
     const accessRequest = await AccessRequest.findById(req.params.id);
     

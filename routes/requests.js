@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { protect, authorize } = require('../middleware/auth');
+const { protect, authorize, blockRestrictedUser } = require('../middleware/auth');
 const Request = require('../models/Request');
 
 function sanitizeRequestAnswers(answers) {
@@ -12,6 +12,35 @@ function sanitizeRequestAnswers(answers) {
   delete cleaned.clientLocation;
   delete cleaned.serviceLocationType;
   return cleaned;
+}
+
+const MIN_REQUEST_BUDGET = 1000;
+const MAX_REQUEST_BUDGET = 100000;
+const REQUEST_BUDGET_STEP = 500;
+
+function parseRequestBudget(value) {
+  const cleaned = String(value ?? '').replace(/[^\d.]/g, '');
+  const amount = Number(cleaned);
+  return Number.isFinite(amount) ? amount : 0;
+}
+
+function validateRequestBudget(value) {
+  const amount = parseRequestBudget(value);
+  if (amount < MIN_REQUEST_BUDGET) {
+    return {
+      valid: false,
+      amount,
+      message: `Minimum request budget is ₹${MIN_REQUEST_BUDGET.toLocaleString('en-IN')}`
+    };
+  }
+  if (amount > MAX_REQUEST_BUDGET || amount % REQUEST_BUDGET_STEP !== 0) {
+    return {
+      valid: false,
+      amount,
+      message: `Budget must be selected between ₹${MIN_REQUEST_BUDGET.toLocaleString('en-IN')} and ₹${MAX_REQUEST_BUDGET.toLocaleString('en-IN')} in ₹${REQUEST_BUDGET_STEP.toLocaleString('en-IN')} steps`
+    };
+  }
+  return { valid: true, amount };
 }
 const Approach = require('../models/Approach');
 const { logAudit } = require('../utils/audit');
@@ -255,7 +284,7 @@ router.get('/available', protect, authorize('expert'), async (req, res) => {
 });
 
 // ─── CREATE NEW REQUEST (CLIENT ONLY) ───
-router.post('/', protect, authorize('client'), async (req, res) => {
+router.post('/', protect, authorize('client'), blockRestrictedUser, async (req, res) => {
   try {
     const { service, title, description, answers, timeline, budget, location } = req.body;
     const cleanAnswers = sanitizeRequestAnswers(answers);
@@ -301,7 +330,15 @@ router.post('/', protect, authorize('client'), async (req, res) => {
         message: 'Location is required' 
       });
     }
-    
+    const budgetCheck = validateRequestBudget(budget);
+    if (!budgetCheck.valid) {
+      return res.status(400).json({
+        success: false,
+        code: 'MIN_BUDGET_REQUIRED',
+        message: budgetCheck.message
+      });
+    }
+
     // Calculate credits
     const credits = await getRequestCredits(service, cleanAnswers);
     console.log('  💰 Calculated credits:', credits);
@@ -314,7 +351,7 @@ router.post('/', protect, authorize('client'), async (req, res) => {
       description,
       answers: cleanAnswers,
       timeline: timeline || 'flexible',
-      budget: budget || '0',
+      budget: String(budgetCheck.amount),
       location,
       credits,
       status: 'pending',
@@ -402,6 +439,21 @@ router.get('/', protect, async (req, res) => {
 });
 
 // ─── GET SINGLE REQUEST BY ID ───
+router.get('/stale-confirmations', protect, authorize('client'), async (req, res) => {
+  try {
+    const requests = await Request.find({
+      client: req.user.id,
+      status: { $in: ['pending', 'active'] },
+      staleReminderSentAt: { $ne: null }
+    }).sort('-staleReminderSentAt').lean();
+
+    res.json({ success: true, count: requests.length, requests });
+  } catch (error) {
+    console.error('Get stale confirmations error:', error);
+    res.status(500).json({ success: false, message: 'Error fetching stale confirmations' });
+  }
+});
+
 router.get('/:id', protect, async (req, res) => {
   try {
     const request = await Request.findById(req.params.id)
@@ -412,6 +464,17 @@ router.get('/:id', protect, async (req, res) => {
         success: false, 
         message: 'Request not found' 
       });
+    }
+
+    const isOwner = request.client && request.client._id && request.client._id.toString() === req.user.id;
+    if (req.user.role === 'client' && !isOwner) {
+      return res.status(403).json({ success: false, message: 'Not authorized' });
+    }
+    if (req.user.role === 'expert' && !['pending', 'active'].includes(request.status)) {
+      const hasApproach = await Approach.exists({ request: request._id, expert: req.user.id });
+      if (!hasApproach) {
+        return res.status(403).json({ success: false, message: 'This request is not available' });
+      }
     }
     
     // Increment view count
@@ -428,7 +491,15 @@ router.get('/:id', protect, async (req, res) => {
       {}
     ).catch(() => {});
     
-    res.json({ success: true, request });
+    const responseRequest = request.toObject();
+    if (!isOwner && responseRequest.client) {
+      responseRequest.client = {
+        _id: responseRequest.client._id,
+        name: responseRequest.client.name
+      };
+    }
+
+    res.json({ success: true, request: responseRequest });
     
   } catch (error) {
     console.error('❌ Get request error:', error);
@@ -488,9 +559,13 @@ router.get('/:id/approaches', protect, authorize('client'), async (req, res) => 
 });
 
 // ─── UPDATE REQUEST STATUS (CLIENT ONLY) ───
-router.put('/:id/status', protect, authorize('client'), async (req, res) => {
+router.put('/:id/status', protect, authorize('client'), blockRestrictedUser, async (req, res) => {
   try {
     const { status } = req.body;
+    const allowedStatuses = ['pending', 'active', 'completed', 'closed', 'cancelled'];
+    if (!allowedStatuses.includes(status)) {
+      return res.status(400).json({ success: false, message: 'Invalid request status' });
+    }
     
     const request = await Request.findById(req.params.id);
     
@@ -525,7 +600,39 @@ router.put('/:id/status', protect, authorize('client'), async (req, res) => {
 });
 
 // ─── DELETE REQUEST (CLIENT ONLY) ───
-router.delete('/:id', protect, authorize('client'), async (req, res) => {
+router.post('/:id/renew', protect, authorize('client'), blockRestrictedUser, async (req, res) => {
+  try {
+    const request = await Request.findById(req.params.id);
+    if (!request) {
+      return res.status(404).json({ success: false, message: 'Request not found' });
+    }
+    if (request.client.toString() !== req.user.id) {
+      return res.status(403).json({ success: false, message: 'Not authorized' });
+    }
+    if (!['pending', 'active'].includes(request.status)) {
+      return res.status(400).json({ success: false, message: 'Only open requests can be renewed' });
+    }
+
+    request.renewedAt = new Date();
+    request.staleReminderSentAt = null;
+    request.renewalCount = (request.renewalCount || 0) + 1;
+    await request.save();
+
+    logAudit(
+      { id: req.user.id, role: 'client', name: req.user.name },
+      'post_renewed',
+      { type: 'request', id: request._id, name: request.title },
+      { renewalCount: request.renewalCount }
+    ).catch(() => {});
+
+    res.json({ success: true, request });
+  } catch (error) {
+    console.error('Renew request error:', error);
+    res.status(500).json({ success: false, message: 'Error renewing request' });
+  }
+});
+
+router.delete('/:id', protect, authorize('client'), blockRestrictedUser, async (req, res) => {
   try {
     const request = await Request.findById(req.params.id);
     
@@ -567,9 +674,15 @@ router.delete('/:id', protect, authorize('client'), async (req, res) => {
   }
 });
 // ─── MARK REQUEST AS COMPLETED (CLIENT ONLY) ───
-router.post('/:id/complete', protect, authorize('client'), async (req, res) => {
+router.post('/:id/complete', protect, authorize('client'), blockRestrictedUser, async (req, res) => {
   try {
     const { expertId } = req.body;
+    if (!expertId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Select the expert who completed this service before marking it completed'
+      });
+    }
     
     console.log('🔍 Completing request:', req.params.id);
     console.log('   Expert ID from body:', expertId);
@@ -587,6 +700,18 @@ router.post('/:id/complete', protect, authorize('client'), async (req, res) => {
       return res.status(403).json({ 
         success: false, 
         message: 'Not authorized' 
+      });
+    }
+
+    const completionApproach = await Approach.findOne({
+      expert: expertId,
+      request: req.params.id,
+      client: req.user.id
+    });
+    if (!completionApproach) {
+      return res.status(400).json({
+        success: false,
+        message: 'Only an expert who approached this request can be marked as completed'
       });
     }
     
@@ -704,7 +829,7 @@ router.get('/test-approach-update', protect, async (req, res) => {
   });
 });
 // ─── REPORT A REQUEST — POST /api/requests/:id/report ───
-router.post('/:id/report', protect, authorize('expert'), async (req, res) => {
+router.post('/:id/report', protect, authorize('expert'), blockRestrictedUser, async (req, res) => {
   try {
     const { reason, note } = req.body;
     const reporterId = req.user.id;
@@ -773,7 +898,7 @@ router.post('/:id/report', protect, authorize('expert'), async (req, res) => {
 });
 
 // ─── UPDATE REQUEST (CLIENT ONLY) ───
-router.put('/:id', protect, authorize('client'), async (req, res) => {
+router.put('/:id', protect, authorize('client'), blockRestrictedUser, async (req, res) => {
   try {
     const { title, description, budget, timeline } = req.body;
 
@@ -794,7 +919,17 @@ router.put('/:id', protect, authorize('client'), async (req, res) => {
 
     if (title)       request.title       = title;
     if (description) request.description = description;
-    if (budget)      request.budget      = budget;
+    if (budget !== undefined) {
+      const budgetCheck = validateRequestBudget(budget);
+      if (!budgetCheck.valid) {
+        return res.status(400).json({
+          success: false,
+          code: 'MIN_BUDGET_REQUIRED',
+          message: budgetCheck.message
+        });
+      }
+      request.budget = String(budgetCheck.amount);
+    }
     if (timeline)    request.timeline    = timeline;
 
     request.updatedAt = new Date();

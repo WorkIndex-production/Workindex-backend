@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const jwt = require('jsonwebtoken');
 const Admin = require('../models/Admin');
+const { submitUrlsToSearchEngines } = require('../utils/searchIndexing');
 
 // Reuse admin protect middleware
 const protect = async (req, res, next) => {
@@ -21,6 +22,20 @@ function superOnly(req, res, next) {
     return res.status(403).json({ success: false, message: 'Super admin only' });
   }
   next();
+}
+
+function sanitizeSeoSlug(input) {
+  var raw = String(input || '').trim().toLowerCase().replace(/\\/g, '/');
+  raw = raw.replace(/^\/+/, '').replace(/\.html$/i, '');
+  if (!raw.startsWith('seo-pages/')) raw = 'seo-pages/' + raw;
+  var parts = raw.split('/')
+    .filter(Boolean)
+    .map(function(part) {
+      return part.replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+    })
+    .filter(Boolean);
+  if (parts[0] !== 'seo-pages') parts.unshift('seo-pages');
+  return parts.join('/');
 }
 
 // ── Generate HTML from template ──
@@ -297,8 +312,7 @@ router.post('/pages', protect, superOnly, async (req, res) => {
       return res.status(400).json({ success: false, message: 'slug, title, and metaDescription are required' });
     }
 
-    // Sanitise slug
-    data.slug = data.slug.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-');
+    data.slug = sanitizeSeoSlug(data.slug);
 
     // Generate HTML
     var html = generateSeoPage(data);
@@ -308,9 +322,12 @@ router.post('/pages', protect, superOnly, async (req, res) => {
       return res.status(500).json({ success: false, message: 'GITHUB_TOKEN not set in Railway env vars' });
     }
     await pushToGitHub(data.slug + '.html', html);
+    var publishedUrl = 'https://workindex.co.in/' + data.slug + '.html';
      await updateSitemap(data.slug); // ← auto-updates sitemap.xml
 
     // Save record in MongoDB
+    var indexing = await submitUrlsToSearchEngines([publishedUrl]);
+
     var existing = await SeoPage.findOne({ slug: data.slug });
     if (existing) {
       await SeoPage.findByIdAndUpdate(existing._id, { ...data, updatedAt: new Date() });
@@ -321,7 +338,8 @@ router.post('/pages', protect, superOnly, async (req, res) => {
     res.json({
       success: true,
       message: 'Page created and pushed to GitHub. Netlify will deploy in ~30 seconds.',
-      url: 'https://workindex.co.in/' + data.slug + '.html'
+      url: publishedUrl,
+      indexing
     });
   } catch(err) {
     console.error('SEO page create error:', err);

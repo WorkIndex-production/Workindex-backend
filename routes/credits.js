@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const crypto = require('crypto');
-const { protect, authorize } = require('../middleware/auth');
+const { protect, authorize, blockRestrictedUser } = require('../middleware/auth');
 const User = require('../models/User');
 const Transaction = require('../models/Transaction');
 const PlatformSettings = require('../models/PlatformSettings');
@@ -122,6 +122,8 @@ router.get('/transactions', protect, authorize('expert'), async (req, res) => {
       .skip(skip)
       .limit(parseInt(limit))
       .populate('relatedApproach')
+      .populate('relatedClient', 'name email')
+      .populate('relatedRequest', 'title service')
       .lean();
     
     const total = await CreditTransaction.countDocuments(query);
@@ -144,7 +146,54 @@ router.get('/transactions', protect, authorize('expert'), async (req, res) => {
 });
 
 // ⭐ REAL: Create Razorpay order — frontend will open Razorpay checkout with this
-router.post('/purchase/initiate', protect, authorize('expert'), async (req, res) => {
+router.get('/ledger', protect, authorize('expert'), async (req, res) => {
+  try {
+    const CreditTransaction = require('../models/CreditTransaction');
+    const transactions = await CreditTransaction.find({ user: req.user.id })
+      .sort('createdAt')
+      .populate('relatedClient', 'name email')
+      .populate('relatedRequest', 'title service')
+      .lean();
+
+    const byDate = new Map();
+    transactions.forEach((tx) => {
+      const date = tx.createdAt
+        ? new Date(tx.createdAt).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' })
+        : 'unknown';
+      if (!byDate.has(date)) {
+        byDate.set(date, {
+          date,
+          opening: tx.balanceBefore || 0,
+          purchase: 0,
+          spent: 0,
+          refund: 0,
+          bonus: 0,
+          inviteBonus: 0,
+          closing: tx.balanceAfter || 0,
+          count: 0
+        });
+      }
+      const row = byDate.get(date);
+      const amount = Number(tx.amount || 0);
+      const desc = String(tx.description || '').toLowerCase();
+      if (tx.type === 'purchase') row.purchase += amount;
+      else if (tx.type === 'spent') row.spent += Math.abs(amount);
+      else if (tx.type === 'refund') row.refund += amount;
+      else if (tx.type === 'bonus' && desc.includes('invite')) row.inviteBonus += amount;
+      else if (tx.type === 'bonus') row.bonus += amount;
+      row.closing = tx.balanceAfter ?? row.closing;
+      row.count += 1;
+    });
+
+    const ledger = Array.from(byDate.values()).sort((a, b) => b.date.localeCompare(a.date));
+    res.json({ success: true, ledger, transactions });
+  } catch (error) {
+    console.error('Get ledger error:', error);
+    res.status(500).json({ success: false, message: 'Error fetching credit ledger' });
+  }
+});
+
+router.post('/purchase/initiate', protect, authorize('expert'), blockRestrictedUser, async (req, res) => {
   try {
     const { packId } = req.body;
 
@@ -202,7 +251,7 @@ router.post('/purchase/initiate', protect, authorize('expert'), async (req, res)
 
 // ⭐ REAL: Verify Razorpay payment using cryptographic signature check
 // Scenario covered: payment succeeded → verify signature → credit user
-router.post('/purchase/verify', protect, authorize('expert'), async (req, res) => {
+router.post('/purchase/verify', protect, authorize('expert'), blockRestrictedUser, async (req, res) => {
   try {
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature, transactionId } = req.body;
 
@@ -364,7 +413,7 @@ router.post('/purchase/verify', protect, authorize('expert'), async (req, res) =
 });
 
 // ⭐ UPDATED: Manual credit addition (for testing/admin)
-router.post('/add', protect, authorize('expert'), async (req, res) => {
+router.post('/add', protect, authorize('expert'), blockRestrictedUser, async (req, res) => {
   try {
     const { credits } = req.body;
     
@@ -435,7 +484,7 @@ purchaseDetails: {
 });
 
 // ⭐ NEW: Deduct credits (used when expert sends approach)
-router.post('/deduct', protect, authorize('expert'), async (req, res) => {
+router.post('/deduct', protect, authorize('expert'), blockRestrictedUser, async (req, res) => {
   try {
     const { credits, approachId, description } = req.body;
     

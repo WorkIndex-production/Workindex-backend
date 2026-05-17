@@ -13,16 +13,24 @@ exports.protect = async (req, res, next) => {
         message: 'Not authorized'
       });
     }
+
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-   req.user = await User.findById(decoded.id);
+    req.user = await User.findById(decoded.id);
     if (!req.user) {
       return res.status(401).json({
         success: false,
         message: 'User not found'
       });
     }
+    if (req.user.isBanned) {
+      return res.status(403).json({
+        success: false,
+        code: 'ACCOUNT_BANNED',
+        message: 'Your account has been banned. Please contact support.'
+      });
+    }
 
-    // Update lastOnline silently (don't await — non-blocking)
+    // Update lastOnline silently without delaying the request.
     User.findByIdAndUpdate(decoded.id, { lastOnline: new Date() }).catch(() => {});
 
     next();
@@ -46,5 +54,15 @@ exports.authorize = (...roles) => {
   };
 };
 
-// ⭐ ADD THIS LINE: Alias for backwards compatibility
+exports.blockRestrictedUser = (req, res, next) => {
+  if (req.user && req.user.isRestricted) {
+    return res.status(403).json({
+      success: false,
+      code: 'ACCOUNT_RESTRICTED',
+      message: 'Your account is restricted. Please contact support before taking this action.'
+    });
+  }
+  next();
+};
+
 exports.authenticate = exports.protect;

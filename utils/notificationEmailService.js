@@ -257,6 +257,26 @@ if (!await isEmailEnabledForUser(userId)) return;
   await logEmail({ to, toName: name, subject: `Post suspended: ${postTitle}`, type, category: 'client', reason: `Post suspended after ${reportCount} reports`, status: result.success ? 'sent' : 'failed', error: result.error || '', userId });
 }
 
+async function sendClientPostStaleReminder({ to, name, postTitle, service, deadline, userId }) {
+  const type = 'client_post_stale_reminder';
+  if (!await isEnabled(type)) return;
+  if (!await isEmailEnabledForUser(userId)) return;
+
+  const deadlineText = deadline
+    ? new Date(deadline).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })
+    : 'within 3 days';
+  const html = layout('Confirm if you still need this service', `
+    ${para(`Hi <strong>${name}</strong>,`)}
+    ${para(`Your WorkIndex request <strong>"${postTitle}"</strong> has been open for 7 days.`)}
+    ${warningBox(`Please log in and confirm by <strong>${deadlineText}</strong> if you still want professionals to approach this request. If we do not hear back, the request will be removed from expert listings so professionals do not spend time on old requirements.`)}
+    ${infoBox(`<strong>Service:</strong> ${service || 'Service request'}<br><strong>Action needed:</strong> Confirm that you still need this service`)}
+    ${ctaButton('Confirm Request', 'https://workindex.co.in')}
+  `);
+
+  const result = await sendViaBrevo({ to, toName: name, subject: `Please confirm your WorkIndex request: ${postTitle}`, htmlContent: html });
+  await logEmail({ to, toName: name, subject: `Stale request reminder: ${postTitle}`, type, category: 'client', reason: 'Request open for 7 days; confirmation required', status: result.success ? 'sent' : 'failed', error: result.error || '', userId });
+}
+
 // 5. Client: Account Restricted
 async function sendClientRestricted({ to, name, reason, warningCount, userId }) {
   const type = 'client_restricted';
@@ -434,6 +454,45 @@ async function sendExpertNewPost({ to, name, postTitle, service, credits, locati
     type,
     category: 'expert',
     reason: `New client request posted for ${service}`,
+    status: result.success ? 'sent' : 'failed',
+    error: result.error || '',
+    userId
+  });
+}
+
+// 10c. Expert: Direct invite received from customer Explore
+async function sendExpertInviteReceived({ to, name, clientName, postTitle, service, credits, location, budget, userId }) {
+  const type = 'expert_invite_received';
+  if (!await isEnabled(type)) return;
+  if (!await isEmailEnabledForUser(userId)) return;
+
+  const html = layout('You received a direct expert invite', `
+    ${para(`Hi <strong>${name}</strong>,`)}
+    ${para(`A customer has selected your profile from Explore and sent you a direct service invite on WorkIndex.`)}
+    ${infoBox(`<strong>Invite Summary:</strong><br>
+      <strong>Customer:</strong> ${clientName || 'Customer'}<br>
+      <strong>Requirement:</strong> ${postTitle || 'Expert invite'}<br>
+      <strong>Service:</strong> ${service || 'Service'}<br>
+      <strong>Budget:</strong> ${budget || 'Not specified'}<br>
+      <strong>Location:</strong> ${location || 'Not specified'}<br>
+      <strong>Credits to unlock contact:</strong> ${credits || 20}`)}
+    ${para(`Review the questionnaire details in your Expert Invites section. If it looks like a good fit, unlock the customer's contact details using credits.`)}
+    ${ctaButton('View Expert Invites', 'https://workindex-frontend.vercel.app')}
+  `);
+
+  const result = await sendViaBrevo({
+    to,
+    toName: name,
+    subject: `New WorkIndex expert invite: ${postTitle || service || 'Service request'}`,
+    htmlContent: html
+  });
+  await logEmail({
+    to,
+    toName: name,
+    subject: `Expert invite received: ${postTitle || service || 'Service request'}`,
+    type,
+    category: 'expert',
+    reason: `Customer ${clientName || 'Customer'} sent a direct expert invite`,
     status: result.success ? 'sent' : 'failed',
     error: result.error || '',
     userId
@@ -669,6 +728,7 @@ module.exports = {
   sendClientPostCreated,
   sendClientExpertApproached,
   sendClientPostSuspended,
+  sendClientPostStaleReminder,
   sendClientRestricted,
   sendClientBanned,
   sendExpertWelcome,
@@ -676,6 +736,7 @@ module.exports = {
   sendExpertCreditsRefunded,
   sendExpertApproachSubmitted,
   sendExpertNewPost,
+  sendExpertInviteReceived,
   sendExpertRestricted,
   sendExpertBanned,
   sendAdminPostSuspended,

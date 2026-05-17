@@ -1,12 +1,14 @@
 const express = require('express');
 const router = express.Router();
-const { protect, authorize } = require('../middleware/auth');
+const { protect, authorize, blockRestrictedUser } = require('../middleware/auth');
 const Rating = require('../models/Rating');
 const Approach = require('../models/Approach');
 const User = require('../models/User');
+const Notification = require('../models/Notification');
+const { logAudit } = require('../utils/audit');
 
 // ⭐ Create a rating/review
-router.post('/', protect, authorize('client'), async (req, res) => {
+router.post('/', protect, authorize('client'), blockRestrictedUser, async (req, res) => {
   try {
     const { 
       expertId, 
@@ -34,8 +36,9 @@ router.post('/', protect, authorize('client'), async (req, res) => {
       });
     }
     
-    // Verify approach if provided (invite-based ratings won't have one)
+    // Ratings must be tied to a completed approach so reviews cannot be created for arbitrary experts.
     let approach = null;
+    let directInvite = null;
     if (approachId) {
       approach = await Approach.findById(approachId).populate('request');
       if (!approach) {
@@ -50,14 +53,68 @@ router.post('/', protect, authorize('client'), async (req, res) => {
       if (approach.hasBeenRated) {
         return res.status(400).json({ success: false, message: 'You have already rated this expert for this request' });
       }
+    } else if (requestId && expertId) {
+      approach = await Approach.findOne({
+        request: requestId,
+        expert: expertId,
+        client: req.user.id
+      }).populate('request');
+      if (!approach) {
+        return res.status(400).json({ success: false, message: 'A completed approach is required before rating this expert' });
+      }
+      if (!approach.isWorkCompleted) {
+        return res.status(400).json({ success: false, message: 'Cannot rate before work is completed' });
+      }
+      if (approach.hasBeenRated) {
+        return res.status(400).json({ success: false, message: 'You have already rated this expert for this request' });
+      }
+    } else if (expertId) {
+      directInvite = await Notification.findOne({
+        user: expertId,
+        type: 'customer_interest',
+        'data.clientId': String(req.user.id),
+        'data.completed': true,
+        'data.cancelled': { $ne: true },
+        'data.rated': { $ne: true }
+      }).sort({ createdAt: -1 });
+      if (!directInvite) {
+        const completedInvite = await Notification.exists({
+          user: expertId,
+          type: 'customer_interest',
+          'data.clientId': String(req.user.id),
+          'data.completed': true,
+          'data.cancelled': { $ne: true }
+        });
+        return res.status(400).json({
+          success: false,
+          message: completedInvite
+            ? 'You have already rated this expert for this invite'
+            : 'A completed approach or expert invite is required before rating this expert'
+        });
+      }
+      const existingInviteRating = await Rating.exists({
+        client: req.user.id,
+        expert: expertId,
+        invite: directInvite._id
+      });
+      if (existingInviteRating) {
+        return res.status(400).json({ success: false, message: 'You have already rated this expert for this invite' });
+      }
+    } else {
+      return res.status(400).json({ success: false, message: 'A completed approach is required before rating this expert' });
+    }
+
+    if (approach && approach.expert.toString() !== String(expertId)) {
+      return res.status(400).json({ success: false, message: 'Rating expert does not match completed approach' });
     }
     
     // Create rating
     const ratingDoc = await Rating.create({
       expert: expertId,
       client: req.user.id,
-      request: requestId || null,
-      approach: approachId || null,
+      request: requestId || (approach && approach.request && approach.request._id) || null,
+      approach: approach ? approach._id : undefined,
+      invite: directInvite ? directInvite._id : undefined,
       rating: rating,
       review: review,
       categories: categories || {},
@@ -70,11 +127,24 @@ router.post('/', protect, authorize('client'), async (req, res) => {
       approach.rating = ratingDoc._id;
       await approach.save();
     }
+    if (directInvite) {
+      await Notification.updateOne(
+        { _id: directInvite._id },
+        { $set: { 'data.rated': true, 'data.ratingId': ratingDoc._id } }
+      );
+    }
     
     // Update expert's rating
     const expert = await User.findById(expertId);
     expert.updateRating(rating);
     await expert.save();
+
+    logAudit(
+      { id: req.user.id, role: 'client', name: req.user.name },
+      'rating_completed',
+      { type: 'rating', id: ratingDoc._id, name: expert.name },
+      { requestId: requestId || null, approachId: approachId || null, inviteId: directInvite ? directInvite._id : null, expertId, rating }
+    ).catch(() => {});
     
     res.status(201).json({
       success: true,
@@ -102,6 +172,40 @@ router.post('/', protect, authorize('client'), async (req, res) => {
 });
 
 // ⭐ Get ratings for an expert
+router.get('/pending/next', protect, authorize('client'), async (req, res) => {
+  try {
+    const pending = await Approach.findOne({
+      client: req.user.id,
+      isWorkCompleted: true,
+      hasBeenRated: { $ne: true },
+      status: 'completed'
+    })
+      .populate('expert', 'name specialization profilePhoto')
+      .populate('request', 'title service')
+      .sort('-workCompletedAt -updatedAt')
+      .lean();
+
+    if (!pending) {
+      return res.json({ success: true, pendingRating: null });
+    }
+
+    res.json({
+      success: true,
+      pendingRating: {
+        approachId: pending._id,
+        expertId: pending.expert && pending.expert._id,
+        expertName: pending.expert && pending.expert.name ? pending.expert.name : 'Expert',
+        requestId: pending.request && pending.request._id,
+        requestTitle: pending.request && pending.request.title ? pending.request.title : 'Completed request',
+        service: pending.request && pending.request.service
+      }
+    });
+  } catch (error) {
+    console.error('Pending rating error:', error);
+    res.status(500).json({ success: false, message: 'Error fetching pending rating' });
+  }
+});
+
 router.get('/expert/:expertId', async (req, res) => {
   try {
     const { 
@@ -289,7 +393,7 @@ router.get('/:id', async (req, res) => {
 });
 
 // ⭐ Expert responds to a rating
-router.post('/:id/respond', protect, authorize('expert'), async (req, res) => {
+router.post('/:id/respond', protect, authorize('expert'), blockRestrictedUser, async (req, res) => {
   try {
     const { message } = req.body;
     
@@ -346,7 +450,7 @@ router.post('/:id/respond', protect, authorize('expert'), async (req, res) => {
 });
 
 // ⭐ Mark rating as helpful
-router.post('/:id/helpful', protect, async (req, res) => {
+router.post('/:id/helpful', protect, blockRestrictedUser, async (req, res) => {
   try {
     const rating = await Rating.findById(req.params.id);
     
@@ -376,7 +480,7 @@ router.post('/:id/helpful', protect, async (req, res) => {
 });
 
 // ⭐ Flag a rating (for inappropriate content)
-router.post('/:id/flag', protect, async (req, res) => {
+router.post('/:id/flag', protect, blockRestrictedUser, async (req, res) => {
   try {
     const { reason } = req.body;
     
@@ -408,7 +512,7 @@ router.post('/:id/flag', protect, async (req, res) => {
 });
 
 // ⭐ Update rating (client can edit within 24 hours)
-router.put('/:id', protect, authorize('client'), async (req, res) => {
+router.put('/:id', protect, authorize('client'), blockRestrictedUser, async (req, res) => {
   try {
     const { rating: newRating, review, categories, wouldRecommend } = req.body;
     

@@ -154,6 +154,12 @@ const userSchema = new mongoose.Schema({
   // Profile strength tracking
   totalApproaches: { type: Number, default: 0 },
   responseRate:    { type: Number, default: 0 },
+  profileViews:    { type: Number, default: 0 },
+  adminBoost:      { type: Number, default: 0 },
+  adminRank:       { type: Number, default: null },
+  questionnaireCompleted: { type: Boolean, default: false },
+  inviteCode:      { type: String, unique: true, sparse: true },
+  referredBy:      { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
 
   // ─── NEW ADMIN FIELDS ───────────────────────────────────
   // Expert registration approval
@@ -253,6 +259,9 @@ userSchema.index({ phone: 1 });
 userSchema.index({ role: 1 });
 userSchema.index({ 'location.city': 1, 'location.state': 1 });
 userSchema.index({ rating: -1 });
+userSchema.index({ adminBoost: -1 });
+userSchema.index({ adminRank: 1 });
+userSchema.index({ inviteCode: 1 }, { sparse: true });
 userSchema.index({ isBanned: 1 });
 userSchema.index({ isApproved: 1 });
 userSchema.index({ googleId: 1 }, { sparse: true });

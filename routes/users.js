@@ -3,10 +3,113 @@ const router = express.Router();
 const multer = require('multer');
 const path = require('path');
 const mongoose = require('mongoose');
-const { protect, authorize } = require('../middleware/auth');
+const { protect, authorize, blockRestrictedUser } = require('../middleware/auth');
 const User = require('../models/User');
 const Rating = require('../models/Rating');
+const ExpertInvite = require('../models/ExpertInvite');
 const { logAudit } = require('../utils/audit');
+const { attachExpertScores } = require('../utils/expertMetrics');
+
+const MIN_REQUEST_BUDGET = 1000;
+const MAX_REQUEST_BUDGET = 100000;
+const REQUEST_BUDGET_STEP = 500;
+
+function parseRequestBudget(value) {
+  const cleaned = String(value ?? '').replace(/[^\d.]/g, '');
+  const amount = Number(cleaned);
+  return Number.isFinite(amount) ? amount : 0;
+}
+
+function validateRequestBudget(value) {
+  const amount = parseRequestBudget(value);
+  if (amount < MIN_REQUEST_BUDGET) {
+    return {
+      valid: false,
+      amount,
+      message: `Minimum request budget is ₹${MIN_REQUEST_BUDGET.toLocaleString('en-IN')}`
+    };
+  }
+  if (amount > MAX_REQUEST_BUDGET || amount % REQUEST_BUDGET_STEP !== 0) {
+    return {
+      valid: false,
+      amount,
+      message: `Budget must be selected between ₹${MIN_REQUEST_BUDGET.toLocaleString('en-IN')} and ₹${MAX_REQUEST_BUDGET.toLocaleString('en-IN')} in ₹${REQUEST_BUDGET_STEP.toLocaleString('en-IN')} steps`
+    };
+  }
+  return { valid: true, amount };
+}
+
+function maskPhone(phone) {
+  const p = String(phone || '').replace(/\D/g, '');
+  if (p.length < 4) return 'XXXXXXXXXX';
+  return p.slice(0, 2) + 'XXXXXX' + p.slice(-2);
+}
+
+function maskEmail(email) {
+  const parts = String(email || '').split('@');
+  if (parts.length < 2 || !parts[0]) return '****@****.com';
+  return parts[0][0] + '****@' + parts[1];
+}
+
+const calculateInviteCredits = (service, answers, defaultCredits) => {
+  const base = { itr: 15, gst: 20, accounting: 25, audit: 30, photography: 18, development: 35 };
+  let credits = base[service] || defaultCredits || 20;
+  if (!answers) return credits;
+  if (service === 'itr') {
+    if (answers.itrAnnualIncome === '10-15') credits = 18;
+    if (answers.itrAnnualIncome === '15-20') credits = 22;
+    if (answers.itrAnnualIncome === 'above20') credits = 28;
+    if (answers.itrIncomeSources && answers.itrIncomeSources.includes('business')) credits += 5;
+    if (answers.itrIncomeSources && answers.itrIncomeSources.includes('foreign')) credits += 5;
+  }
+  if (service === 'gst') {
+    if (answers.gstTurnover === '5-20') credits = 22;
+    if (answers.gstTurnover === '20-50') credits = 27;
+    if (answers.gstTurnover === 'above50') credits = 35;
+  }
+  if (service === 'accounting') {
+    if (answers.accountingTransactions === '100-500') credits = 28;
+    if (answers.accountingTransactions === '500-2000') credits = 32;
+    if (answers.accountingTransactions === 'above2000') credits = 40;
+  }
+  if (service === 'audit') {
+    if (answers.auditTurnover === '1-5cr') credits = 35;
+    if (answers.auditTurnover === '5-20cr') credits = 45;
+    if (answers.auditTurnover === 'above20cr') credits = 60;
+  }
+  if (service === 'photography') {
+    if (answers.photographyDuration === 'half-day') credits = 22;
+    if (answers.photographyDuration === 'full-day') credits = 28;
+    if (answers.photographyDuration === 'multiple') credits = 35;
+    if (answers.photographyVideography === 'yes') credits += 5;
+  }
+  if (service === 'development') {
+    if (answers.devProjectType === 'website') credits = 30;
+    if (answers.devProjectType === 'ecommerce') credits = 38;
+    if (answers.devProjectType === 'mobile-app') credits = 45;
+    if (answers.devProjectType === 'web-app') credits = 50;
+    if (answers.devProjectType === 'custom') credits = 55;
+    if (answers.devMaintenance === 'yes') credits += 5;
+  }
+  return Math.min(credits, 60);
+};
+
+async function getInviteCredits(service, answers) {
+  try {
+    const ServiceCategory = require('../models/ServiceCategory');
+    const category = await ServiceCategory.findOne({ value: String(service || '').toLowerCase(), isActive: { $ne: false } })
+      .select('creditCost')
+      .lean();
+    if (category && category.creditCost) return category.creditCost;
+  } catch(e) {}
+  let defaultCredits = 20;
+  try {
+    const PlatformSettings = require('../models/PlatformSettings');
+    const settings = await PlatformSettings.findOne({ singleton: true }).lean();
+    if (settings && settings.defaultPostCredits) defaultCredits = settings.defaultPostCredits;
+  } catch(e) {}
+  return calculateInviteCredits(service, answers, defaultCredits);
+}
 
 function normalizeForAudit(value) {
   if (value === undefined || value === null) return '';
@@ -94,6 +197,78 @@ function isValidIndianPhone(phone) {
 // ────────────────────────────────────────────────────────────────────────────
 
 // ✅ FIXED: Use memory storage instead of disk storage
+function firstFilled() {
+  for (let i = 0; i < arguments.length; i++) {
+    const val = arguments[i];
+    if (Array.isArray(val) && val.length) return val;
+    if (val && typeof val === 'object' && Object.keys(val).length) return val;
+    if (typeof val === 'string' && val.trim()) return val.trim();
+    if (val !== undefined && val !== null && typeof val !== 'string' && !Array.isArray(val) && typeof val !== 'object') return val;
+  }
+  return '';
+}
+
+function normalizeExpertProfileForSave(profile) {
+  const p = Object.assign({}, profile || {});
+  const loc = p.expert_location_details && typeof p.expert_location_details === 'object'
+    ? p.expert_location_details
+    : {};
+
+  p.servicesOffered = firstFilled(p.servicesOffered, p.expert_services, p.services);
+  p.specialization = firstFilled(p.specialization, p.expert_specialization);
+  p.experience = firstFilled(p.experience, p.expert_experience, p.yearsOfExperience);
+  p.serviceLocationType = firstFilled(p.serviceLocationType, p.expert_location);
+  p.businessType = firstFilled(p.businessType, p.expert_business_type, p.business_type);
+  p.teamSize = firstFilled(p.teamSize, p.expert_team_size, p.team_size);
+  p.bio = firstFilled(p.bio, p.expert_bio);
+  p.city = firstFilled(p.city, p.expert_city, loc.city);
+  p.state = firstFilled(p.state, p.expert_state, loc.state);
+  p.pincode = firstFilled(p.pincode, p.expert_pincode, loc.pincode);
+  p.professionalAddress = firstFilled(p.professionalAddress, p.expert_professional_address, p.professional_address, p.address);
+  p.gstNumber = firstFilled(p.gstNumber, p.expert_gst_number, p.gst_number);
+  p.licenseNumber = firstFilled(p.licenseNumber, p.expert_license_number, p.license_number, p.professionalLicense);
+  p.certificationNumber = firstFilled(p.certificationNumber, p.expert_certification_number, p.certification_number);
+  p.education = firstFilled(p.education, p.expert_education);
+  p.portfolio = firstFilled(p.portfolio, p.expert_portfolio);
+
+  if (!p.expert_location_details && (p.city || p.state || p.pincode)) {
+    p.expert_location_details = {
+      city: p.city || '',
+      state: p.state || '',
+      pincode: p.pincode || ''
+    };
+  }
+
+  return p;
+}
+
+const DIRECT_PROFILE_FIELDS = [
+  'servicesOffered', 'expert_services', 'services',
+  'specialization', 'expert_specialization',
+  'experience', 'expert_experience', 'yearsOfExperience',
+  'serviceLocationType', 'expert_location',
+  'businessType', 'expert_business_type', 'business_type',
+  'teamSize', 'expert_team_size', 'team_size',
+  'bio', 'expert_bio',
+  'city', 'expert_city', 'state', 'expert_state', 'pincode', 'expert_pincode',
+  'professionalAddress', 'expert_professional_address', 'professional_address', 'address',
+  'gstNumber', 'expert_gst_number', 'gst_number',
+  'licenseNumber', 'expert_license_number', 'license_number', 'professionalLicense',
+  'certificationNumber', 'expert_certification_number', 'certification_number',
+  'education', 'expert_education',
+  'portfolio', 'expert_portfolio',
+  'fullAddress', 'clientLocation', 'service_location_type', 'full_address', 'client_location',
+  'browseServiceFilter'
+];
+
+function extractDirectProfilePayload(body) {
+  const direct = {};
+  DIRECT_PROFILE_FIELDS.forEach(key => {
+    if (Object.prototype.hasOwnProperty.call(body, key)) direct[key] = body[key];
+  });
+  return direct;
+}
+
 const storage = multer.memoryStorage();
 
 const upload = multer({
@@ -125,6 +300,11 @@ router.get('/me', protect, async (req, res) => {
         phone: user.phone,
         role: user.role,
         credits: user.credits,
+        inviteCode: user.inviteCode,
+        questionnaireCompleted: user.questionnaireCompleted || false,
+        profileViews: user.profileViews || 0,
+        adminBoost: user.adminBoost || 0,
+        adminRank: user.adminRank || null,
         profilePhoto: user.profilePhoto,
         profile: user.profile,
         specialization: user.specialization,
@@ -449,8 +629,22 @@ router.post('/portfolio', protect, authorize('expert'), upload.single('image'), 
 // Update profile data (for expert questionnaire)
 router.put('/profile', protect, async (req, res) => {
   try {
-    const profile = req.body.profile || {};
-    const previousUser = await User.findById(req.user.id).select('profile whyChooseMe phone name role').lean();
+    const hasNestedProfilePayload = Object.prototype.hasOwnProperty.call(req.body, 'profile')
+      && req.body.profile
+      && typeof req.body.profile === 'object'
+      && !Array.isArray(req.body.profile);
+    const directProfile = extractDirectProfilePayload(req.body || {});
+    const hasDirectProfilePayload = Object.keys(directProfile).length > 0;
+    const hasProfilePayload = hasNestedProfilePayload || hasDirectProfilePayload;
+    const incomingProfile = {
+      ...(hasNestedProfilePayload ? req.body.profile : {}),
+      ...directProfile
+    };
+    const previousUser = await User.findById(req.user.id).select('profile whyChooseMe phone name role questionnaireCompleted').lean();
+    const previousProfile = (previousUser && previousUser.profile && typeof previousUser.profile === 'object') ? previousUser.profile : {};
+    const profile = hasProfilePayload
+      ? normalizeExpertProfileForSave(Object.assign({}, previousProfile, incomingProfile))
+      : previousProfile;
 
     // Build location update from all possible sources
     const locationUpdate = {};
@@ -483,20 +677,22 @@ router.put('/profile', protect, async (req, res) => {
       }
       topLevelUpdate.phone = phoneToSave;
     }
-    
+    const updateData = {
+      ...locationUpdate,
+      ...topLevelUpdate
+    };
+    if (hasProfilePayload) updateData.profile = profile;
+    if (req.user.role === 'expert' && hasProfilePayload) updateData.questionnaireCompleted = true;
+
     const user = await User.findByIdAndUpdate(
       req.user.id,
-      { 
-        profile: profile,
-        ...locationUpdate,
-        ...topLevelUpdate
-      },
+      { $set: updateData },
       { new: true, runValidators: false }
     ).select('-password');
 
 try {
-  const changedFields = getChangedProfileFields(previousUser, profile, topLevelUpdate);
-  const fieldsToLog = changedFields.length ? changedFields : Object.keys(profile);
+  const changedFields = hasProfilePayload ? getChangedProfileFields(previousUser, profile, topLevelUpdate) : Object.keys(topLevelUpdate);
+  const fieldsToLog = changedFields.length ? changedFields : Object.keys(incomingProfile);
   fieldsToLog.forEach(field => {
     logAudit(
       { id: req.user._id, role: req.user.role, name: req.user.name },
@@ -517,6 +713,7 @@ try {
         phone: user.phone,
         role: user.role,
         credits: user.credits,
+        questionnaireCompleted: user.questionnaireCompleted || false,
         profile: user.profile
       }
     });
@@ -595,6 +792,51 @@ router.get('/location-suggestions', async (req, res) => {
   }
 });
 
+router.get('/invite-summary', protect, authorize('expert'), async (req, res) => {
+  try {
+    let user = await User.findById(req.user.id).select('inviteCode name credits');
+    if (!user.inviteCode) {
+      user.inviteCode = String(user.name || 'WI').replace(/[^a-z0-9]/gi, '').slice(0, 5).toUpperCase() + Math.random().toString(36).slice(2, 8).toUpperCase();
+      await user.save();
+    }
+    const invites = await ExpertInvite.find({ inviter: user._id })
+      .populate('invitedUser', 'name email createdAt totalApproaches')
+      .sort({ createdAt: -1 })
+      .limit(100)
+      .lean();
+    res.json({ success: true, inviteCode: user.inviteCode, credits: user.credits || 0, invites });
+  } catch (error) {
+    console.error('Invite summary error:', error);
+    res.status(500).json({ success: false, message: 'Error loading invites' });
+  }
+});
+
+router.post('/validate-invite', async (req, res) => {
+  try {
+    const code = String(req.body.inviteCode || req.query.inviteCode || '').trim().toUpperCase();
+    if (!code) return res.json({ success: true, valid: false });
+    const expert = await User.findOne({ role: 'expert', inviteCode: code, emailVerified: true }).select('name inviteCode').lean();
+    res.json({ success: true, valid: !!expert, expert: expert ? { name: expert.name, inviteCode: expert.inviteCode } : null });
+  } catch (error) {
+    res.status(500).json({ success: false, valid: false });
+  }
+});
+
+router.post('/expert/:id/profile-view', async (req, res) => {
+  try {
+    const expert = await User.findOneAndUpdate(
+      { _id: req.params.id, role: 'expert' },
+      { $inc: { profileViews: 1 } },
+      { new: true }
+    ).select('profileViews').lean();
+    if (!expert) return res.status(404).json({ success: false, message: 'Expert not found' });
+    res.json({ success: true, profileViews: expert.profileViews || 0 });
+  } catch (error) {
+    console.error('Profile view count error:', error);
+    res.status(500).json({ success: false, message: 'Error recording profile view' });
+  }
+});
+
 // Get all experts
 router.get('/experts', async (req, res) => {
   try {
@@ -645,19 +887,26 @@ if (minRating) {
   query.rating = { $gte: parseFloat(minRating) };
 }
     
-    let sort = '-rating';
-    if (sortBy === 'newest') sort = '-createdAt';
-    if (sortBy === 'reviews') sort = '-reviewCount';
-    if (sortBy === 'name') sort = 'name';
-    
     const skip = (page - 1) * limit;
     
-    const experts = await User.find(query)
-      .select('name profilePhoto specialization bio location rating reviewCount servicesOffered certifications companyName yearsOfExperience createdAt profile')
-      .sort(sort)
-      .skip(skip)
-      .limit(parseInt(limit))
+    let allExperts = await User.find(query)
+      .select('name profilePhoto specialization bio location rating reviewCount servicesOffered certifications companyName yearsOfExperience createdAt profile totalApproaches adminBoost adminRank profileViews questionnaireCompleted')
       .lean();
+    allExperts = allExperts.map(attachExpertScores);
+
+    if (sortBy === 'newest') allExperts.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    else if (sortBy === 'reviews') allExperts.sort((a, b) => (b.reviewCount || 0) - (a.reviewCount || 0));
+    else if (sortBy === 'name') allExperts.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+    else allExperts.sort((a, b) => {
+      const ar = Number(a.adminRank || 0);
+      const br = Number(b.adminRank || 0);
+      if (ar > 0 && br > 0 && ar !== br) return ar - br;
+      if (ar > 0 && !br) return -1;
+      if (!ar && br > 0) return 1;
+      return (b.searchScore || 0) - (a.searchScore || 0);
+    });
+
+    const experts = allExperts.slice(skip, skip + parseInt(limit));
     
     const total = await User.countDocuments(query);
     
@@ -667,7 +916,7 @@ if (minRating) {
       total: total,
       page: parseInt(page),
       pages: Math.ceil(total / limit),
-      experts
+        experts
     });
   } catch (error) {
     console.error('Get experts error:', error);
@@ -700,12 +949,13 @@ router.get('/expert/:id', async (req, res) => {
     }
   } catch(e) {}
   try {
+    await User.findByIdAndUpdate(req.params.id, { $inc: { profileViews: 1 } });
     // ✅ Filter by role directly in DB query instead of checking after fetch
     const expert = await User.findOne({ 
       _id: req.params.id, 
       role: 'expert'
     })
-    .select('name profilePhoto specialization qualifications rating reviewCount bio portfolio location companyName servicesOffered certifications yearsOfExperience createdAt profile availability whyChooseMe lastOnline')
+    .select('name profilePhoto specialization qualifications rating reviewCount bio portfolio location companyName servicesOffered certifications yearsOfExperience createdAt profile availability whyChooseMe lastOnline profileViews adminBoost adminRank totalApproaches')
     .lean();
     
     if (!expert) {
@@ -725,9 +975,10 @@ router.get('/expert/:id', async (req, res) => {
     .limit(10)
     .lean();
     
+    const scoredExpert = attachExpertScores(expert);
     res.json({ 
       success: true, 
-      expert,
+      expert: scoredExpert,
       ratings
     });
   } catch (error) {
@@ -803,7 +1054,7 @@ router.post('/:id/block', protect, authorize('client'), async (req, res) => {
 });
 
 // ─── SHORTLIST OR HIRE EXPERT (client action) ───
-router.post('/:id/interest', protect, authorize('client'), async (req, res) => {
+router.post('/:id/interest', protect, authorize('client'), blockRestrictedUser, async (req, res) => {
   try {
     const { type } = req.body; // 'shortlist' or 'hire'
     const expertId = req.params.id;
@@ -836,20 +1087,22 @@ router.post('/:id/interest', protect, authorize('client'), async (req, res) => {
 
     // ── HIRE ──
     if (type === 'hire') {
+      const payload = req.body || {};
+      const answers = payload.answers || {};
+      const service = String(payload.service || answers.service || '').toLowerCase();
+      const budgetCheck = validateRequestBudget(payload.budget || answers.budget || 0);
+      if (!service) return res.status(400).json({ success: false, message: 'Service is required' });
+      if (!budgetCheck.valid) return res.status(400).json({ success: false, message: budgetCheck.message });
       const phone = req.user.phone || '';
       const email = req.user.email || '';
+      const credits = await getInviteCredits(service, answers);
 
       // Build masked versions
-      const maskedPhone = phone.length >= 4
-        ? phone.slice(0, 2) + 'XXXXXX' + phone.slice(-2)
-        : 'XXXXXXXXXX';
-      const emailParts = email.split('@');
-      const maskedEmail = emailParts[0]
-        ? emailParts[0][0] + '****@' + (emailParts[1] || '')
-        : '****@****.com';
+      const maskedPhone = maskPhone(phone);
+      const maskedEmail = maskEmail(email);
 
       // Send notification to expert
-      const Notification = mongoose.models['Notification'];
+      const Notification = mongoose.models['Notification'] || require('../models/Notification');
       if (Notification) {
         await Notification.create({
           user: expertId,
@@ -858,12 +1111,23 @@ router.post('/:id/interest', protect, authorize('client'), async (req, res) => {
           message: `A client wants to hire you for their project. Spend 5 credits to unlock their full contact details (phone + email) and reach out directly.`,
           data: {
             clientId: clientId.toString(),
+            expertId: expertId.toString(),
+            service,
+            title: payload.title || 'Direct expert invite',
+            description: payload.description || answers.description || 'Request details in questionnaire',
+            answers,
+            timeline: payload.timeline || answers.urgency || 'flexible',
+            budget: String(budgetCheck.amount),
+            location: payload.location || 'Online / Remote',
+            credits,
+            status: 'pending',
             maskedPhone,
             maskedEmail,
             fullPhone: phone,
             fullEmail: email,
             clientName: req.user.name,
-            unlocked: false
+            unlocked: false,
+            source: 'expert_invite'
           },
           isRead: false
         });
@@ -891,6 +1155,124 @@ router.post('/:id/interest', protect, authorize('client'), async (req, res) => {
 });
 
 // ─── GET CLIENT'S SHORTLISTED EXPERTS ───
+router.post('/expert-invites', protect, authorize('client'), blockRestrictedUser, async (req, res) => {
+  try {
+    const { expertId, service, title, description, answers, timeline, budget, location } = req.body || {};
+    const expert = await User.findById(expertId);
+    if (!expert || expert.role !== 'expert') return res.status(404).json({ success: false, message: 'Expert not found' });
+    const serviceValue = String(service || (answers && answers.service) || '').toLowerCase();
+    if (!serviceValue) return res.status(400).json({ success: false, message: 'Service is required' });
+    const budgetCheck = validateRequestBudget(budget || (answers && answers.budget) || 0);
+    if (!budgetCheck.valid) return res.status(400).json({ success: false, message: budgetCheck.message });
+
+    const Notification = mongoose.models['Notification'] || require('../models/Notification');
+    const cleanAnswers = { ...(answers || {}), service: serviceValue, budget: budgetCheck.amount };
+    const credits = await getInviteCredits(serviceValue, cleanAnswers);
+    const phone = req.user.phone || '';
+    const email = req.user.email || '';
+    const invite = await Notification.create({
+      user: expert._id,
+      type: 'customer_interest',
+      title: 'New Expert Invite',
+      message: 'A client sent you a direct service request. Review the details before unlocking contact information.',
+      data: {
+        clientId: req.user._id.toString(),
+        expertId: expert._id.toString(),
+        service: serviceValue,
+        title: title || 'Direct expert invite',
+        description: description || cleanAnswers.description || 'Request details in questionnaire',
+        answers: cleanAnswers,
+        timeline: timeline || cleanAnswers.urgency || 'flexible',
+        budget: String(budgetCheck.amount),
+        location: location || 'Online / Remote',
+        credits,
+        status: 'pending',
+        maskedPhone: maskPhone(phone),
+        maskedEmail: maskEmail(email),
+        fullPhone: phone,
+        fullEmail: email,
+        clientName: req.user.name,
+        unlocked: false,
+        source: 'expert_invite'
+      },
+      isRead: false
+    });
+
+    try {
+      const { sendExpertInviteReceived } = require('../utils/notificationEmailService');
+      sendExpertInviteReceived({
+        to: expert.email,
+        name: expert.name,
+        clientName: req.user.name,
+        postTitle: title || 'Direct expert invite',
+        service: serviceValue,
+        credits,
+        location: location || 'Online / Remote',
+        budget: `Rs. ${budgetCheck.amount.toLocaleString('en-IN')}`,
+        userId: expert._id
+      }).catch(() => {});
+    } catch(e) {}
+
+    logAudit(
+      { id: req.user._id, role: 'client', name: req.user.name },
+      'client_sent_expert_invite',
+      { type: 'user', id: expert._id, name: expert.name },
+      { service: serviceValue, credits }
+    ).catch(() => {});
+
+    res.status(201).json({ success: true, invite });
+  } catch (err) {
+    console.error('Create expert invite error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.put('/expert-invites/:notifId', protect, authorize('client'), blockRestrictedUser, async (req, res) => {
+  try {
+    const Notification = mongoose.models['Notification'] || require('../models/Notification');
+    const notif = await Notification.findById(req.params.notifId);
+    if (!notif || notif.type !== 'customer_interest') return res.status(404).json({ success: false, message: 'Invite not found' });
+    const data = notif.data || {};
+    if (String(data.clientId) !== String(req.user._id)) return res.status(403).json({ success: false, message: 'Not authorized' });
+    if (data.cancelled || data.completed) return res.status(400).json({ success: false, message: 'Cannot edit a closed invite' });
+
+    const next = { ...data };
+    ['title', 'description', 'timeline', 'location'].forEach(key => {
+      if (req.body[key] !== undefined) next[key] = req.body[key];
+    });
+    if (req.body.answers && typeof req.body.answers === 'object') next.answers = { ...(next.answers || {}), ...req.body.answers };
+    if (req.body.service !== undefined) next.service = String(req.body.service).toLowerCase();
+    if (req.body.budget !== undefined) {
+      const budgetCheck = validateRequestBudget(req.body.budget);
+      if (!budgetCheck.valid) return res.status(400).json({ success: false, message: budgetCheck.message });
+      next.budget = String(budgetCheck.amount);
+      next.answers = { ...(next.answers || {}), budget: budgetCheck.amount };
+    }
+    next.credits = await getInviteCredits(next.service, next.answers || {});
+    await Notification.updateOne({ _id: notif._id }, { $set: { data: next } });
+    res.json({ success: true, invite: { ...notif.toObject(), data: next } });
+  } catch (err) {
+    console.error('Edit expert invite error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.post('/expert-invites/:notifId/cancel', protect, authorize('client'), blockRestrictedUser, async (req, res) => {
+  try {
+    const Notification = mongoose.models['Notification'] || require('../models/Notification');
+    const notif = await Notification.findById(req.params.notifId);
+    if (!notif || notif.type !== 'customer_interest') return res.status(404).json({ success: false, message: 'Invite not found' });
+    const data = notif.data || {};
+    if (String(data.clientId) !== String(req.user._id)) return res.status(403).json({ success: false, message: 'Not authorized' });
+    const next = { ...data, status: 'cancelled', cancelled: true, cancelledAt: new Date() };
+    await Notification.updateOne({ _id: notif._id }, { $set: { data: next, isRead: true } });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Cancel expert invite error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.get('/shortlisted', protect, authorize('client'), async (req, res) => {
   try {
     const client = await User.findById(req.user._id)
@@ -911,11 +1293,10 @@ router.get('/shortlisted', protect, authorize('client'), async (req, res) => {
 });
 
 // ─── EXPERT UNLOCKS CUSTOMER INTEREST NOTIFICATION ───
-router.post('/unlock-interest/:notifId', protect, authorize('expert'), async (req, res) => {
+router.post('/unlock-interest/:notifId', protect, authorize('expert'), blockRestrictedUser, async (req, res) => {
   try {
-    const Notification = mongoose.models['Notification'];
+    const Notification = mongoose.models['Notification'] || require('../models/Notification');
     const CreditTransaction = require('../models/CreditTransaction');
-    const UNLOCK_COST = 15;
 
     if (!Notification) {
       return res.status(503).json({ success: false, message: 'Notification system unavailable' });
@@ -924,6 +1305,10 @@ router.post('/unlock-interest/:notifId', protect, authorize('expert'), async (re
     const notif = await Notification.findById(req.params.notifId);
     if (!notif || notif.user.toString() !== req.user._id.toString()) {
       return res.status(404).json({ success: false, message: 'Notification not found' });
+    }
+    const unlockCost = Number((notif.data && notif.data.credits) || 15);
+    if (notif.data && notif.data.cancelled) {
+      return res.status(400).json({ success: false, message: 'This invite was cancelled by the customer' });
     }
 
     // Already unlocked — just return details
@@ -941,10 +1326,10 @@ router.post('/unlock-interest/:notifId', protect, authorize('expert'), async (re
 
     // Check credits
     const expert = await User.findById(req.user._id);
-    if ((expert.credits || 0) < UNLOCK_COST) {
+    if ((expert.credits || 0) < unlockCost) {
       return res.status(400).json({
         success: false,
-        message: `Need ${UNLOCK_COST} credits to unlock. You have ${expert.credits || 0}.`,
+        message: `Need ${unlockCost} credits to unlock. You have ${expert.credits || 0}.`,
         needCredits: true
       });
     }
@@ -952,7 +1337,7 @@ router.post('/unlock-interest/:notifId', protect, authorize('expert'), async (re
     // Deduct credits
         // Deduct credits
     const balanceBefore = expert.credits;
-    expert.credits -= UNLOCK_COST;
+    expert.credits -= unlockCost;
     await expert.save();
 
     // Log credit transaction
@@ -960,10 +1345,10 @@ router.post('/unlock-interest/:notifId', protect, authorize('expert'), async (re
       await CreditTransaction.create({
         user: expert._id,
         type: 'spent',
-        amount: -UNLOCK_COST,
+        amount: -unlockCost,
         balanceBefore,
         balanceAfter: expert.credits,
-        description: 'Unlocked customer hire interest'
+        description: 'Unlocked expert invite contact'
       });
     } catch (txErr) {
       console.log('CreditTransaction log failed (non-fatal):', txErr.message);
@@ -980,13 +1365,16 @@ router.post('/unlock-interest/:notifId', protect, authorize('expert'), async (re
     // Build a completely new data object and replace — this is the ONLY reliable
     // way to save Mixed type in Mongoose
     const newData = {
+      ...(notif.data || {}),
       clientId,
       clientName,
       fullPhone,
       fullEmail,
       maskedPhone,
       maskedEmail,
-      unlocked: true
+      unlocked: true,
+      status: 'accepted',
+      unlockedAt: new Date()
     };
 
     // Use replaceOne to force full document update — bypasses Mixed type issues
@@ -1003,12 +1391,12 @@ router.post('/unlock-interest/:notifId', protect, authorize('expert'), async (re
       { id: expert._id, role: 'expert', name: expert.name },
       'expert_accepted_hire',
       { type: 'user', id: clientId, name: clientName },
-      { creditsSpent: UNLOCK_COST }
+      { creditsSpent: unlockCost }
     ).catch(() => {});
     
     res.json({
       success: true,
-      creditsSpent: UNLOCK_COST,
+      creditsSpent: unlockCost,
       newBalance: expert.credits,
       client: {
         name: clientName || 'Client',
@@ -1040,11 +1428,14 @@ router.get('/my-invites', protect, authorize('client'), async (req, res) => {
     const expertMap = {};
     experts.forEach(e => { expertMap[String(e._id)] = e; });
 
-    const enriched = invites.map(n => ({
+const enriched = invites.map(n => ({
   _id: n._id,
   expert: expertMap[String(n.user)] || {},
   unlocked: (n.data && n.data.unlocked) || false,
   completed: (n.data && n.data.completed) || false,
+  cancelled: (n.data && n.data.cancelled) || false,
+  status: (n.data && n.data.status) || ((n.data && n.data.unlocked) ? 'accepted' : 'pending'),
+  data: n.data || {},
   createdAt: n.createdAt
 }));
 
@@ -1054,7 +1445,7 @@ router.get('/my-invites', protect, authorize('client'), async (req, res) => {
   }
 });
 // ─── MARK INVITE AS COMPLETED (CLIENT ONLY) ───
-router.post('/invite-complete/:notifId', protect, authorize('client'), async (req, res) => {
+router.post('/invite-complete/:notifId', protect, authorize('client'), blockRestrictedUser, async (req, res) => {
   try {
     const Notification = mongoose.models['Notification'] || require('../models/Notification');
     
@@ -1075,7 +1466,7 @@ router.post('/invite-complete/:notifId', protect, authorize('client'), async (re
 
     await Notification.updateOne(
       { _id: notif._id },
-      { $set: { 'data.completed': true, 'data.completedAt': new Date() } }
+      { $set: { 'data.completed': true, 'data.status': 'completed', 'data.completedAt': new Date() } }
     );
 
     console.log(`✅ Invite ${notif._id} marked completed by client ${req.user._id}`);
@@ -1086,7 +1477,7 @@ router.post('/invite-complete/:notifId', protect, authorize('client'), async (re
   }
 });
 // ─── UPDATE AVAILABILITY (EXPERT ONLY) ───
-router.put('/availability', protect, authorize('expert'), async (req, res) => {
+router.put('/availability', protect, authorize('expert'), blockRestrictedUser, async (req, res) => {
   try {
     const { availability } = req.body;
     if (!['available', 'busy', 'away'].includes(availability)) {

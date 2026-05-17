@@ -10,9 +10,19 @@ const app = express();
 // MIDDLEWARE
 // ═══════════════════════════════════════════════════════════
 
-app.use(cors({ 
-  origin: process.env.FRONTEND_URL || '*', 
-  credentials: true 
+const configuredFrontendOrigins = (process.env.FRONTEND_URL || '')
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin) return callback(null, true);
+    if (configuredFrontendOrigins.includes(origin)) return callback(null, true);
+    if (/^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(origin)) return callback(null, true);
+    return callback(null, false);
+  },
+  credentials: true
 }));
 
 // ⭐ Raw body needed ONLY for Razorpay webhook — must come before express.json
@@ -82,6 +92,8 @@ app.use('/api/users', userRoutes);
 app.use('/api/requests', requestRoutes);
 app.use('/api/approaches', approachRoutes);
 app.use('/api/credits', creditRoutes);
+app.use('/api/payment', require('./routes/payments'));
+app.use('/api/payments', require('./routes/payments'));
 app.use('/api/documents', documentRoutes);
 app.use('/api/access-requests', accessRequestRoutes);
 app.use('/api/ratings', ratingRoutes);
@@ -133,11 +145,20 @@ mongoose.connect(process.env.MONGODB_URI, {
 .then(() => {
   console.log('✅ MongoDB connected successfully');
   console.log(`📊 Database: ${mongoose.connection.name}`);
+  require('./utils/databaseIndexes').ensureRatingIndexes()
+    .then(() => console.log('✅ Rating indexes verified'))
+    .catch(err => console.error('⚠️ Rating index verification failed:', err.message));
   
   app.listen(PORT, () => {
     // ─── CRON: Daily ticket digest at 9:30 PM IST ───
     const cron = require('node-cron');
     const { sendAdminDailyTicketDigest } = require('./utils/notificationEmailService');
+    const { processStaleRequests } = require('./utils/requestLifecycle');
+    cron.schedule('30 3 * * *', async () => {
+      console.log('Running stale request lifecycle cron...');
+      const result = await processStaleRequests();
+      console.log('Stale request lifecycle result:', result);
+    }, { timezone: 'Asia/Kolkata' });
     cron.schedule('0 16 * * *', async () => {
       console.log('⏰ Running daily ticket digest cron...');
       await sendAdminDailyTicketDigest();

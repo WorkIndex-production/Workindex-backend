@@ -28,6 +28,11 @@ approach: {
   ref: 'Approach',
   required: false
 },
+invite: {
+  type: mongoose.Schema.Types.ObjectId,
+  ref: 'Notification',
+  required: false
+},
   
   // Rating (1-5 stars)
   rating: {
@@ -120,8 +125,15 @@ ratingSchema.index({ client: 1 });
 ratingSchema.index({ rating: -1 });
 ratingSchema.index({ isPublic: 1, isFlagged: 1 });
 
-// Ensure one rating per approach
-ratingSchema.index({ approach: 1 }, { unique: true });
+// Ensure one rating per completed approach or completed direct invite.
+ratingSchema.index(
+  { approach: 1 },
+  { unique: true, partialFilterExpression: { approach: { $type: 'objectId' } } }
+);
+ratingSchema.index(
+  { invite: 1 },
+  { unique: true, partialFilterExpression: { invite: { $type: 'objectId' } } }
+);
 
 // Calculate average from categories if provided
 ratingSchema.pre('save', function(next) {

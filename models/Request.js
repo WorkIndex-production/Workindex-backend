@@ -33,7 +33,14 @@ const requestSchema = new mongoose.Schema({
   },
   budget: {
     type: String,
-    default: '0'
+    default: '1000',
+    validate: {
+      validator(value) {
+        const amount = Number(String(value ?? '').replace(/[^\d.]/g, ''));
+        return Number.isFinite(amount) && amount >= 1000;
+      },
+      message: 'Minimum request budget is ₹1,000'
+    }
   },
   location: {
     type: String,
@@ -54,7 +61,7 @@ const requestSchema = new mongoose.Schema({
   },
   status: {
     type: String,
-    enum: ['pending', 'active', 'completed','closed', 'cancelled'],
+    enum: ['pending', 'active', 'completed','closed', 'cancelled', 'purged'],
     default: 'pending'
   },
   
@@ -97,6 +104,12 @@ const requestSchema = new mongoose.Schema({
     default: null
   },
 
+  staleReminderSentAt: { type: Date, default: null },
+  renewedAt: { type: Date, default: null },
+  renewalCount: { type: Number, default: 0 },
+  purgedAt: { type: Date, default: null },
+  purgeReason: { type: String, default: null },
+
   reports: [
     {
       by:     { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
@@ -117,6 +130,7 @@ const requestSchema = new mongoose.Schema({
 requestSchema.index({ client: 1, createdAt: -1 });
 requestSchema.index({ service: 1, status: 1 });
 requestSchema.index({ status: 1, createdAt: -1 });
+requestSchema.index({ status: 1, staleReminderSentAt: 1, renewedAt: 1, createdAt: 1 });
 requestSchema.index({ location: 1 });
 
 // Virtual for approach count (if you want to calculate dynamically)

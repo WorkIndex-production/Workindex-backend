@@ -7,6 +7,7 @@ const jwt     = require('jsonwebtoken');
 const { OAuth2Client } = require('google-auth-library');
 
 const User = require('../models/User');
+const ExpertInvite = require('../models/ExpertInvite');
 const { sendOTPEmail } = require('../utils/emailService');
 
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
@@ -19,6 +20,24 @@ const generateToken = (id) =>
 const generateOTP = () =>
   Math.floor(100000 + Math.random() * 900000).toString();
 
+const makeInviteCode = (name) => {
+  const prefix = String(name || 'WI').replace(/[^a-z0-9]/gi, '').slice(0, 5).toUpperCase() || 'WI';
+  return prefix + Math.random().toString(36).slice(2, 8).toUpperCase();
+};
+
+async function ensureInviteCode(user) {
+  if (user.role !== 'expert' || user.inviteCode) return;
+  let code = makeInviteCode(user.name);
+  while (await User.exists({ inviteCode: code })) code = makeInviteCode(user.name);
+  user.inviteCode = code;
+}
+
+async function findInviter(inviteCode) {
+  const code = String(inviteCode || '').trim().toUpperCase();
+  if (!code) return null;
+  return User.findOne({ role: 'expert', inviteCode: code, emailVerified: true }).select('_id inviteCode');
+}
+
 
 // ═══════════════════════════════════════════════════════════
 // STEP 1 — Verify Google token
@@ -29,7 +48,7 @@ const generateOTP = () =>
 // ═══════════════════════════════════════════════════════════
 router.post('/google-init', async (req, res) => {
   try {
-    const { credential, role } = req.body;
+    const { credential, role, inviteCode } = req.body;
 
     if (!credential) {
       return res.status(400).json({ success: false, message: 'Google credential missing.' });
@@ -68,6 +87,7 @@ router.post('/google-init', async (req, res) => {
       if (!existingVerified.googleId) existingVerified.googleId = googleId;
       if (!existingVerified.profilePhoto && picture) existingVerified.profilePhoto = picture;
       existingVerified.lastLogin = Date.now();
+      await ensureInviteCode(existingVerified);
       await existingVerified.save();
 
       try {
@@ -91,18 +111,21 @@ router.post('/google-init', async (req, res) => {
 
     // ── NEW USER — send OTP to their Google email ────────
     const signupRole = role && ['client', 'expert'].includes(role) ? role : 'client';
+    const inviter = signupRole === 'expert' ? await findInviter(inviteCode) : null;
 
     // Remove any previous unverified attempt
     await User.deleteOne({ email, emailVerified: false });
 
     const otp = generateOTP();
 
-    await User.create({
+    const pendingUser = await User.create({
       name,
       email,
       phone:         undefined,
       password:      Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2),
       role:          signupRole,
+      credits:       50,
+      referredBy:    inviter ? inviter._id : null,
       googleId,
       profilePhoto:  picture || '',
       emailVerified: false,
@@ -110,6 +133,14 @@ router.post('/google-init', async (req, res) => {
       emailOTP:      otp,
       otpExpiry:     new Date(Date.now() + 10 * 60 * 1000),
     });
+
+    if (inviter) {
+      await ExpertInvite.findOneAndUpdate(
+        { inviter: inviter._id, invitedEmail: email },
+        { inviter: inviter._id, invitedEmail: email, invitedUser: pendingUser._id, inviteCode: inviter.inviteCode, status: 'invited' },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      );
+    }
 
     const emailResult = await sendOTPEmail({ to: email, name, otp, purpose: 'signup' });
 
@@ -171,10 +202,19 @@ router.post('/google-verify-otp', async (req, res) => {
 
     user.emailVerified = true;
     user.phoneVerified = false;
+    await ensureInviteCode(user);
     user.emailOTP      = undefined;
     user.otpExpiry     = undefined;
     user.lastLogin     = Date.now();
     await user.save();
+
+    if (user.role === 'expert' && user.referredBy) {
+      await ExpertInvite.findOneAndUpdate(
+        { inviter: user.referredBy, invitedUser: user._id },
+        { inviter: user.referredBy, invitedUser: user._id, invitedEmail: user.email, status: 'approach_pending' },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      );
+    }
 
     try {
       const { sendClientWelcome, sendExpertWelcome } = require('../utils/notificationEmailService');
@@ -253,6 +293,8 @@ function buildUserObject(user) {
     emailVerified: user.emailVerified,
     phoneVerified: user.phoneVerified,
     profile:       user.profile || {},
+    inviteCode:    user.inviteCode,
+    questionnaireCompleted: user.questionnaireCompleted || false,
     profilePhoto:  user.profilePhoto,
     location:      user.location,
     preferences:   user.preferences,

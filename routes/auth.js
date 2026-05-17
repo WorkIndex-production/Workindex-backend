@@ -4,6 +4,7 @@ const router  = express.Router();
 const jwt     = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
 const User = require('../models/User');
+const ExpertInvite = require('../models/ExpertInvite');
 const { sendOTPEmail } = require('../utils/emailService');
 
 // ─── HELPERS ─────────────────────────────────────────────
@@ -14,6 +15,24 @@ const generateToken = (id) =>
 
 const generateOTP = () =>
   Math.floor(100000 + Math.random() * 900000).toString();
+
+const makeInviteCode = (name) => {
+  const prefix = String(name || 'WI').replace(/[^a-z0-9]/gi, '').slice(0, 5).toUpperCase() || 'WI';
+  return prefix + Math.random().toString(36).slice(2, 8).toUpperCase();
+};
+
+async function ensureInviteCode(user) {
+  if (user.role !== 'expert' || user.inviteCode) return;
+  let code = makeInviteCode(user.name);
+  while (await User.exists({ inviteCode: code })) code = makeInviteCode(user.name);
+  user.inviteCode = code;
+}
+
+async function findInviter(inviteCode) {
+  const code = String(inviteCode || '').trim().toUpperCase();
+  if (!code) return null;
+  return User.findOne({ role: 'expert', inviteCode: code, emailVerified: true }).select('_id inviteCode');
+}
 
 // ═══════════════════════════════════════════════════════════
 // SIGNUP STEP 1 — Collect details & send OTP
@@ -32,7 +51,8 @@ router.post('/send-otp', [
       return res.status(400).json({ success: false, message: errors.array()[0].msg });
     }
 
-    const { name, email, phone, password, role } = req.body;
+    const { name, email, phone, password, role, inviteCode } = req.body;
+    const inviter = role === 'expert' ? await findInviter(inviteCode) : null;
 
     // Check if a verified account already exists
     const existing = await User.findOne({
@@ -56,17 +76,27 @@ router.post('/send-otp', [
     const otp = generateOTP();
 
     // Create pending (unverified) user
-    await User.create({
+    const pendingUser = await User.create({
       name,
       email,
       phone,
       password,
       role,
+      credits: 50,
+      referredBy: inviter ? inviter._id : null,
       emailVerified: false,
       phoneVerified: false,
       emailOTP:  otp,
       otpExpiry: new Date(Date.now() + 10 * 60 * 1000) // 10 min
     });
+
+    if (inviter) {
+      await ExpertInvite.findOneAndUpdate(
+        { inviter: inviter._id, invitedEmail: email },
+        { inviter: inviter._id, invitedEmail: email, invitedUser: pendingUser._id, inviteCode: inviter.inviteCode, status: 'invited' },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      );
+    }
 
     // Send OTP email
     const emailResult = await sendOTPEmail({ to: email, name, otp, purpose: 'signup' });
@@ -128,9 +158,18 @@ router.post('/verify-otp-register', [
     // Activate account
     user.emailVerified = true;
     user.phoneVerified = true;
+    await ensureInviteCode(user);
     user.emailOTP  = undefined;
     user.otpExpiry = undefined;
     await user.save();
+
+    if (user.role === 'expert' && user.referredBy) {
+      await ExpertInvite.findOneAndUpdate(
+        { inviter: user.referredBy, invitedUser: user._id },
+        { inviter: user.referredBy, invitedUser: user._id, invitedEmail: user.email, status: 'approach_pending' },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      );
+    }
 
 try {
   const { sendClientWelcome, sendExpertWelcome } = require('../utils/notificationEmailService');
@@ -162,6 +201,8 @@ try {
         phone:         user.phone,
         role:          user.role,
         credits:       user.credits,
+        inviteCode:    user.inviteCode,
+        questionnaireCompleted: user.questionnaireCompleted || false,
         emailVerified: user.emailVerified,
         phoneVerified: user.phoneVerified,
         profile:       user.profile || {}
@@ -251,6 +292,7 @@ router.post('/login', [
     }
 
     user.lastLogin = Date.now();
+    await ensureInviteCode(user);
     await user.save();
 
     // ── Audit: login ──
@@ -279,6 +321,8 @@ router.post('/login', [
         emailVerified: user.emailVerified,
         phoneVerified: user.phoneVerified,
         profile:       user.profile || {},
+        inviteCode:    user.inviteCode,
+        questionnaireCompleted: user.questionnaireCompleted || false,
         profilePhoto:  user.profilePhoto,
         location:      user.location,
         preferences:   user.preferences,
@@ -468,7 +512,7 @@ const { protect } = require('../middleware/auth');
 router.get('/me', protect, async (req, res) => {
   try {
     const user = await User.findById(req.user.id || req.user.userId)
-  .select('warnings lastWarning isRestricted isFlagged isBanned credits preferences').lean();
+  .select('warnings lastWarning isRestricted isFlagged isBanned credits preferences profile inviteCode questionnaireCompleted profileViews adminBoost rating reviewCount totalApproaches').lean();
     if (!user) return res.status(404).json({ success: false });
     res.json({ success: true, user });
   } catch (err) {

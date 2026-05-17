@@ -5,6 +5,7 @@ const jwt      = require('jsonwebtoken');
 const mongoose = require('mongoose');
 const bcrypt   = require('bcryptjs');
 const Admin    = require('../models/Admin');
+const { attachExpertScores } = require('../utils/expertMetrics');
 const Notification = require('../models/Notification');  // ← ADD THIS
 
 
@@ -198,7 +199,9 @@ router.get('/users', protect, async (req, res) => {
     ];
     addDateFilter(query, 'createdAt', from, to);
             var users = await User.find(query)
-      .select('name email phone role credits createdAt lastLogin isFlagged isBanned isRestricted isApproved isRejected warnings rating reviewCount profile specialization location kyc requests')      .sort({ createdAt: -1 }).skip(skip).limit(limit);
+      .select('name email phone role credits createdAt lastLogin isFlagged isBanned isRestricted isApproved isRejected warnings rating reviewCount profile specialization location kyc requests totalApproaches adminBoost adminRank profileViews questionnaireCompleted inviteCode')
+      .sort({ createdAt: -1 }).skip(skip).limit(limit);
+    if (role === 'expert') users = users.map(function(u) { return attachExpertScores(u); });
     var total = await User.countDocuments(query);
     res.json({ success: true, users, total });
   } catch (err) { res.status(500).json({ success: false }); }
@@ -245,6 +248,56 @@ router.get('/users/:id', protect, async (req, res) => {
   } catch (err) { console.error('Get user error:', err); res.status(500).json({ success: false }); }
 });
 
+router.get('/expert-boosts', protect, async (req, res) => {
+  try {
+    var User = mongoose.model('User');
+    var experts = await User.find({ role: 'expert' })
+      .select('name email phone rating reviewCount totalApproaches adminBoost adminRank profileViews profile specialization servicesOffered location createdAt')
+      .lean();
+    experts = experts.map(function(e) { return attachExpertScores(e); })
+      .sort(function(a, b) {
+        var ar = Number(a.adminRank || 0);
+        var br = Number(b.adminRank || 0);
+        if (ar > 0 && br > 0 && ar !== br) return ar - br;
+        if (ar > 0 && !br) return -1;
+        if (!ar && br > 0) return 1;
+        return (b.searchScore || 0) - (a.searchScore || 0);
+      });
+    res.json({ success: true, experts: experts });
+  } catch (err) {
+    console.error('Expert boosts error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.put('/experts/:id/boost', protect, async (req, res) => {
+  try {
+    var User = mongoose.model('User');
+    var boost = Math.max(0, Math.min(100, Number(req.body.adminBoost || 0)));
+    var rankInput = req.body.adminRank === '' || req.body.adminRank === null || req.body.adminRank === undefined
+      ? null
+      : Math.max(1, Number(req.body.adminRank || 0));
+    var expert = await User.findOneAndUpdate(
+      { _id: req.params.id, role: 'expert' },
+      { adminBoost: boost, adminRank: Number.isFinite(rankInput) ? rankInput : null },
+      { new: true }
+    ).select('name email rating reviewCount totalApproaches adminBoost adminRank profileViews profile specialization servicesOffered location');
+    if (!expert) return res.status(404).json({ success: false, message: 'Expert not found' });
+    try {
+      const { logAudit } = require('../utils/audit');
+      logAudit(
+        { id: req.admin._id, role: 'admin', name: req.admin.name || req.admin.adminId },
+        'expert_admin_boost_updated',
+        { type: 'user', id: expert._id, name: expert.name },
+        { adminBoost: boost, adminRank: rankInput }
+      ).catch(() => {});
+    } catch(e) {}
+    res.json({ success: true, expert: attachExpertScores(expert) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // ===========================================================
 // NEW: ADJUST USER CREDITS
 // ===========================================================
@@ -263,7 +316,7 @@ router.post('/users/:id/credits', protect, cp('credits','write'), async (req, re
     var newBalance;
     var txAmount;
     // Use explicit type from frontend if provided; otherwise infer from action
-    var txType = reqType || (action === 'add' ? 'refund' : 'adjustment');
+    var txType = reqType || (action === 'add' ? 'refund' : 'penalty');
 
     if (action === 'add') {
       newBalance = oldBalance + amount;
@@ -273,11 +326,11 @@ router.post('/users/:id/credits', protect, cp('credits','write'), async (req, re
     } else if (action === 'deduct') {
       newBalance = Math.max(0, oldBalance - amount);
       txAmount = -(amount);
-      if (!reqType) txType = 'adjustment';
+      if (!reqType) txType = 'penalty';
     } else if (action === 'set') {
       txAmount = amount - oldBalance;
       newBalance = amount;
-      if (!reqType) txType = 'adjustment';
+      if (!reqType) txType = txAmount >= 0 ? 'refund' : 'penalty';
     } else {
       return res.status(400).json({ success: false, message: 'Invalid action' });
     }
@@ -1745,9 +1798,9 @@ router.put('/email-settings', protect, async (req, res) => {
     // Remove any non-setting keys for safety
     const allowed = [
       'client_welcome','client_post_created','client_expert_approached',
-      'client_post_suspended','client_restricted','client_banned',
+      'client_post_suspended','client_post_stale_reminder','client_restricted','client_banned',
       'expert_welcome','expert_credits_purchased','expert_credits_refunded',
-      'expert_approach_sent','expert_new_post','expert_restricted','expert_banned',
+      'expert_approach_sent','expert_new_post','expert_invite_received','expert_restricted','expert_banned',
       'admin_post_suspended','admin_user_restricted','admin_ticket_escalated','admin_daily_tickets'
     ];
     const safe = {};
@@ -1798,9 +1851,29 @@ router.get('/revenue', protect, async (req, res) => {
   try {
     var CreditTx = safeReq('../models/CreditTransaction');
     var Request  = mongoose.model('Request');
+    var User = mongoose.model('User');
+    var Approach = safeReq('../models/Approach');
+    var Transaction = safeReq('../models/Transaction');
     if (!CreditTx) return res.json({ success: true, summary: {}, byPeriod: [], byService: [] });
 
-    var { period = 'month' } = req.query; // day | week | month
+    var period = req.query.period || 'month'; // day | week | month
+    var from = req.query.from;
+    var to = req.query.to;
+    var creditMatch = {};
+    var requestMatch = {};
+    if (from || to) {
+      creditMatch.createdAt = {};
+      requestMatch.createdAt = {};
+      if (from) {
+        creditMatch.createdAt.$gte = new Date(from);
+        requestMatch.createdAt.$gte = new Date(from);
+      }
+      if (to) {
+        var toDate = new Date(new Date(to).setHours(23, 59, 59, 999));
+        creditMatch.createdAt.$lte = toDate;
+        requestMatch.createdAt.$lte = toDate;
+      }
+    }
 
     // ── Date grouping format ──
     var groupId;
@@ -1814,6 +1887,7 @@ router.get('/revenue', protect, async (req, res) => {
 
     // ── Overall summary ──
     var summaryAgg = await CreditTx.aggregate([
+      { $match: creditMatch },
       { $group: {
         _id: '$type',
         totalCredits: { $sum: '$amount' },
@@ -1821,16 +1895,35 @@ router.get('/revenue', protect, async (req, res) => {
         count: { $sum: 1 }
       }}
     ]);
-    var summary = { purchased: 0, spent: 0, refunded: 0, bonus: 0, amountReceived: 0, txCount: 0 };
+    var summary = {
+      purchased: 0, spent: 0, refunded: 0, bonus: 0, penalties: 0, expired: 0,
+      inviteBonus: 0, amountReceived: 0, txCount: 0, purchaseCount: 0, refundCount: 0,
+      paidExperts: 0, avgOrderValue: 0, refundRate: 0, netCredits: 0,
+      openRequests: 0, completedRequests: 0, purgedRequests: 0, totalRequests: 0,
+      totalApproaches: 0, completedApproaches: 0
+    };
     summaryAgg.forEach(function(a) {
-      if (a._id === 'purchase') { summary.purchased = a.totalCredits; summary.amountReceived = a.totalAmount || 0; summary.txCount = a.count; }
-      if (a._id === 'spent')    summary.spent    = Math.abs(a.totalCredits);
-      if (a._id === 'refund')   summary.refunded = a.totalCredits;
-      if (a._id === 'bonus')    summary.bonus    = a.totalCredits;
+      summary.txCount += a.count || 0;
+      if (a._id === 'purchase') { summary.purchased = a.totalCredits; summary.amountReceived = a.totalAmount || 0; summary.purchaseCount = a.count || 0; }
+      if (a._id === 'spent')    summary.spent    = Math.abs(a.totalCredits || 0);
+      if (a._id === 'refund')   { summary.refunded = Math.abs(a.totalCredits || 0); summary.refundCount = a.count || 0; }
+      if (a._id === 'bonus')    summary.bonus    = a.totalCredits || 0;
+      if (a._id === 'penalty')  summary.penalties = Math.abs(a.totalCredits || 0);
+      if (a._id === 'expired')  summary.expired = Math.abs(a.totalCredits || 0);
     });
+    var inviteBonusAgg = await CreditTx.aggregate([
+      { $match: Object.assign({}, creditMatch, { type: 'bonus', description: /invite/i }) },
+      { $group: { _id: null, total: { $sum: '$amount' } } }
+    ]);
+    summary.inviteBonus = inviteBonusAgg[0] ? inviteBonusAgg[0].total : 0;
+    summary.netCredits = summary.purchased + summary.bonus + summary.refunded - summary.spent - summary.penalties - summary.expired;
+    summary.paidExperts = await CreditTx.distinct('user', Object.assign({}, creditMatch, { type: 'purchase' })).then(function(ids) { return ids.length; });
+    summary.avgOrderValue = summary.purchaseCount ? Math.round(summary.amountReceived / summary.purchaseCount) : 0;
+    summary.refundRate = summary.purchaseCount ? Math.round((summary.refundCount / summary.purchaseCount) * 100) : 0;
 
     // ── By period (time series) ──
     var periodAgg = await CreditTx.aggregate([
+      { $match: creditMatch },
       { $group: {
         _id: { period: groupId, type: '$type' },
         totalCredits: { $sum: '$amount' },
@@ -1849,18 +1942,21 @@ router.get('/revenue', protect, async (req, res) => {
       else if (period === 'week') label = p.y + '-W' + String(p.w).padStart(2,'0');
       else label = p.y + '-' + String(p.m).padStart(2,'0');
 
-      if (!periodMap[label]) periodMap[label] = { label, purchased: 0, spent: 0, refunded: 0, amountReceived: 0 };
+      if (!periodMap[label]) periodMap[label] = { label, purchased: 0, spent: 0, refunded: 0, bonus: 0, penalties: 0, amountReceived: 0, txCount: 0 };
       var t = a._id.type;
+      periodMap[label].txCount += a.count || 0;
       if (t === 'purchase') { periodMap[label].purchased += a.totalCredits; periodMap[label].amountReceived += (a.totalAmount || 0); }
-      if (t === 'spent')    periodMap[label].spent    += Math.abs(a.totalCredits);
-      if (t === 'refund')   periodMap[label].refunded += a.totalCredits;
+      if (t === 'spent')    periodMap[label].spent    += Math.abs(a.totalCredits || 0);
+      if (t === 'refund')   periodMap[label].refunded += Math.abs(a.totalCredits || 0);
+      if (t === 'bonus')    periodMap[label].bonus += a.totalCredits || 0;
+      if (t === 'penalty')  periodMap[label].penalties += Math.abs(a.totalCredits || 0);
     });
     var byPeriod = Object.values(periodMap);
 
     // ── Date filter for service breakdown ──
-    var serviceDateQ = {};
+    var serviceDateQ = Object.assign({}, requestMatch);
     var svcPeriod = req.query.svcPeriod || 'all';
-    if (svcPeriod !== 'all') {
+    if (svcPeriod !== 'all' && !from && !to) {
       var svcFrom = new Date();
       if (svcPeriod === 'day')   svcFrom.setDate(svcFrom.getDate() - 1);
       if (svcPeriod === 'week')  svcFrom.setDate(svcFrom.getDate() - 7);
@@ -1874,37 +1970,128 @@ router.get('/revenue', protect, async (req, res) => {
       { $group: {
         _id: '$service',
         count: { $sum: 1 },
-        totalCredits: { $sum: '$creditsRequired' }
+        active: { $sum: { $cond: [{ $in: ['$status', ['pending', 'active']] }, 1, 0] } },
+        completed: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] } },
+        purged: { $sum: { $cond: [{ $eq: ['$status', 'purged'] }, 1, 0] } },
+        totalCredits: { $sum: '$credits' },
+        totalViews: { $sum: '$viewCount' }
       }},
       { $sort: { count: -1 } }
     ]);
 
     // ── Expert count per service ──
-        var User = mongoose.model('User');
-    var expertAgg = await User.aggregate([
-      { $match: { role: 'expert' } },
-      { $unwind: '$servicesOffered' },
-      { $group: { _id: '$servicesOffered', expertCount: { $sum: 1 } } }
-    ]);
+    var approachMatch = serviceDateQ.createdAt ? { createdAt: serviceDateQ.createdAt } : {};
+    var approachServiceAgg = Approach ? await Approach.aggregate([
+      { $match: approachMatch },
+      { $lookup: { from: 'requests', localField: 'request', foreignField: '_id', as: 'requestDoc' } },
+      { $unwind: '$requestDoc' },
+      { $group: {
+        _id: '$requestDoc.service',
+        approachCount: { $sum: 1 },
+        approachCredits: { $sum: '$creditsSpent' },
+        completedApproaches: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] } }
+      }}
+    ]) : [];
+    var approachServiceMap = {};
+    approachServiceAgg.forEach(function(a) {
+      approachServiceMap[(a._id || '').toLowerCase()] = a;
+    });
+
+    var experts = await User.find({ role: 'expert' }).select('servicesOffered profile').lean();
     var expertCountMap = {};
-    expertAgg.forEach(function(e) {
-      if (e._id) expertCountMap[e._id.toLowerCase()] = e.expertCount;
+    experts.forEach(function(expert) {
+      var services = [];
+      if (Array.isArray(expert.servicesOffered)) services = services.concat(expert.servicesOffered);
+      if (expert.profile) {
+        ['servicesOffered', 'expert_services', 'services'].forEach(function(key) {
+          if (Array.isArray(expert.profile[key])) services = services.concat(expert.profile[key]);
+          else if (expert.profile[key]) services.push(expert.profile[key]);
+        });
+      }
+      Array.from(new Set(services.map(function(s) { return String(s || '').toLowerCase().trim(); }).filter(Boolean))).forEach(function(service) {
+        expertCountMap[service] = (expertCountMap[service] || 0) + 1;
+      });
     });
 
     // Total requests for share %
     var totalRequests = reqAgg.reduce(function(sum, r) { return sum + r.count; }, 0) || 1;
 
     var byService = reqAgg.map(function(r) {
+      var serviceKey = (r._id || '').toLowerCase();
+      var approachStats = approachServiceMap[serviceKey] || {};
       return {
         _id: r._id,
         count: r.count,
+        active: r.active || 0,
+        completed: r.completed || 0,
+        purged: r.purged || 0,
         totalCredits: r.totalCredits || 0,
-        expertCount: expertCountMap[(r._id||'').toLowerCase()] || 0,
-        share: Math.round((r.count / totalRequests) * 100)
+        totalViews: r.totalViews || 0,
+        approachCount: approachStats.approachCount || 0,
+        approachCredits: approachStats.approachCredits || 0,
+        completedApproaches: approachStats.completedApproaches || 0,
+        expertCount: expertCountMap[serviceKey] || 0,
+        share: Math.round((r.count / totalRequests) * 100),
+        conversionRate: r.count ? Math.round(((approachStats.approachCount || 0) / r.count) * 100) : 0
       };
     });
 
-    res.json({ success: true, summary, byPeriod, byService });
+    var requestStatusAgg = await Request.aggregate([
+      { $match: requestMatch },
+      { $group: { _id: '$status', count: { $sum: 1 } } }
+    ]);
+    requestStatusAgg.forEach(function(r) {
+      summary.totalRequests += r.count || 0;
+      if (r._id === 'completed') summary.completedRequests = r.count || 0;
+      if (r._id === 'purged') summary.purgedRequests = r.count || 0;
+      if (['pending', 'active'].indexOf(r._id) !== -1) summary.openRequests += r.count || 0;
+    });
+    var appDateMatch = creditMatch.createdAt ? { createdAt: creditMatch.createdAt } : {};
+    summary.totalApproaches = Approach ? await Approach.countDocuments(appDateMatch) : 0;
+    summary.completedApproaches = Approach ? await Approach.countDocuments(Object.assign({ status: 'completed' }, appDateMatch)) : 0;
+
+    var paymentStatus = [];
+    if (Transaction) {
+      paymentStatus = await Transaction.aggregate([
+        { $match: Object.assign({ type: 'credit_purchase' }, creditMatch.createdAt ? { createdAt: creditMatch.createdAt } : {}) },
+        { $group: { _id: '$paymentStatus', count: { $sum: 1 }, amount: { $sum: '$amount' }, credits: { $sum: '$credits' } } },
+        { $sort: { count: -1 } }
+      ]);
+    }
+
+    var recentTransactions = await CreditTx.find(creditMatch)
+      .populate('user', 'name email role')
+      .populate('relatedRequest', 'title service')
+      .populate('relatedClient', 'name email')
+      .sort({ createdAt: -1 })
+      .limit(12)
+      .lean();
+
+    var topExpertsBySpend = await CreditTx.aggregate([
+      { $match: Object.assign({}, creditMatch, { type: 'spent' }) },
+      { $group: { _id: '$user', spent: { $sum: { $abs: '$amount' } }, unlocks: { $sum: 1 } } },
+      { $sort: { spent: -1 } },
+      { $limit: 8 },
+      { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'user' } },
+      { $unwind: '$user' },
+      { $project: { spent: 1, unlocks: 1, name: '$user.name', email: '$user.email', credits: '$user.credits' } }
+    ]);
+
+    var creditMix = [
+      { label: 'Purchased', value: summary.purchased },
+      { label: 'Spent', value: summary.spent },
+      { label: 'Refunded', value: summary.refunded },
+      { label: 'Bonus', value: summary.bonus },
+      { label: 'Penalty', value: summary.penalties }
+    ].filter(function(r) { return r.value > 0; });
+    var funnel = [
+      { label: 'Requests', value: summary.totalRequests },
+      { label: 'Approaches', value: summary.totalApproaches },
+      { label: 'Completed Requests', value: summary.completedRequests },
+      { label: 'Purged Requests', value: summary.purgedRequests }
+    ];
+
+    res.json({ success: true, summary, byPeriod, byService, creditMix, paymentStatus, recentTransactions, topExpertsBySpend, funnel });
   } catch (err) {
     console.error('Revenue error:', err);
     res.status(500).json({ success: false, message: err.message });

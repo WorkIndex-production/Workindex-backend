@@ -299,6 +299,27 @@ function buildExpertSection(expertCat) {
           state:  { label:'State',   placeholder:'Select state', required:true, type:'select', autoFilled:true },
         }
       },
+      { id:'expert_business_type', key:'expert_business_type', type:'single', required:true,
+        title:'What is your business type?', subtitle:'Select the type of entity you operate under',
+        options:[
+          {value:'proprietor', label:'Proprietorship'},
+          {value:'partnership', label:'Partnership Firm'},
+          {value:'llp', label:'Limited Liability Partnership (LLP)'},
+          {value:'pvt_ltd', label:'Private Limited Company'},
+          {value:'public_ltd', label:'Public Limited Company'},
+          {value:'opc', label:'One Person Company (OPC)'},
+          {value:'freelancer', label:'Freelancer / Individual Professional'},
+        ]},
+      { id:'expert_team_size', key:'expert_team_size', type:'single', required:true,
+        title:'How many employees or team members do you have?', subtitle:'Include full-time staff, partners, and active team members',
+        options:[
+          {value:'solo', label:'Just me (1)'},
+          {value:'2_4', label:'2 - 4 members'},
+          {value:'5_15', label:'5 - 15 members'},
+          {value:'16_50', label:'16 - 50 members'},
+          {value:'51_100', label:'51 - 100 members'},
+          {value:'100_plus', label:'100+ members'},
+        ]},
       { id:'expert_bio',     key:'bio',     type:'textarea',required:true,  title:'Tell clients about yourself',    subtitle:'Your bio appears on your public profile', placeholder:'e.g. I am a Chartered Accountant with 8 years of experience...', minLength:50, maxLength:500, validation:'Minimum 50 characters required' },
     ], null, 4);
   }
@@ -317,6 +338,16 @@ return JSON.stringify(
         state:   { label: 'State',   placeholder: 'Select state',    required: true, type: 'select', autoFilled: true }
       };
     }
+    const keyOverrides = {
+      expert_services: 'expert_services',
+      expert_specialization: 'expert_specialization',
+      expert_experience: 'expert_experience',
+      expert_location: 'expert_location',
+      expert_business_type: 'expert_business_type',
+      expert_team_size: 'expert_team_size',
+      expert_bio: 'expert_bio'
+    };
+    if (keyOverrides[q.id]) built.key = keyOverrides[q.id];
     return built;
   }),
   null, 4
@@ -500,6 +531,43 @@ async function syncToGitHub() {
   }
   await pushServicesConfig(content);
   return content;
+}
+
+function getMissingExpertSeedQuestions(existingIds) {
+  const additions = [
+    {
+      id: 'expert_business_type',
+      question: 'What is your business type?',
+      subtitle: 'Select the type of entity you operate under',
+      type: 'radio',
+      required: true,
+      options: [
+        { value: 'proprietor', label: 'Proprietorship' },
+        { value: 'partnership', label: 'Partnership Firm' },
+        { value: 'llp', label: 'Limited Liability Partnership (LLP)' },
+        { value: 'pvt_ltd', label: 'Private Limited Company' },
+        { value: 'public_ltd', label: 'Public Limited Company' },
+        { value: 'opc', label: 'One Person Company (OPC)' },
+        { value: 'freelancer', label: 'Freelancer / Individual Professional' }
+      ]
+    },
+    {
+      id: 'expert_team_size',
+      question: 'How many employees or team members do you have?',
+      subtitle: 'Include full-time staff, partners, and active team members',
+      type: 'radio',
+      required: true,
+      options: [
+        { value: 'solo', label: 'Just me (1)' },
+        { value: '2_4', label: '2 - 4 members' },
+        { value: '5_15', label: '5 - 15 members' },
+        { value: '16_50', label: '16 - 50 members' },
+        { value: '51_100', label: '51 - 100 members' },
+        { value: '100_plus', label: '100+ members' }
+      ]
+    }
+  ];
+  return additions.filter(q => !existingIds.has(q.id));
 }
  
 // ===========================================================
@@ -941,9 +1009,31 @@ router.post('/seed-expert', protect, superOnly, async (req, res) => {
   try {
     const existing = await ServiceCategory.findOne({ value: '_expert' });
     if (existing) {
+      const existingIds = new Set((existing.questions || []).map(q => q.id));
+      const missing = getMissingExpertSeedQuestions(existingIds);
+      if (missing.length) {
+        existing.questions.push(...missing);
+        await existing.save();
+        let githubPushed = false;
+        try {
+          await syncToGitHub();
+          githubPushed = true;
+        } catch(e) {
+          console.error('GitHub push failed (non-fatal):', e.message);
+        }
+        return res.json({
+          success: true,
+          message: 'Expert steps updated with missing questions',
+          category: existing,
+          added: missing.map(q => q.id),
+          githubPushed
+        });
+      }
       return res.json({
-        success: false,
-        message: 'Expert steps already exist. Use the Edit button to modify them.'
+        success: true,
+        message: 'Expert steps already exist and are up to date.',
+        category: existing,
+        githubPushed: false
       });
     }
  
@@ -996,6 +1086,7 @@ router.post('/seed-expert', protect, superOnly, async (req, res) => {
             state:   { label: 'State',   placeholder: 'Select state',    required: true, type: 'select', autoFilled: true },
           }
         },
+        ...getMissingExpertSeedQuestions(new Set()),
         {
           id: 'expert_bio', question: 'Tell clients about yourself', type: 'textarea', required: true,
           subtitle: 'Your bio appears on your public profile',

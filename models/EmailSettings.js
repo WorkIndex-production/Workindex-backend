@@ -10,6 +10,7 @@ const emailSettingsSchema = new mongoose.Schema({
   client_post_created:      { type: Boolean, default: true },
   client_expert_approached: { type: Boolean, default: true },
   client_post_suspended:    { type: Boolean, default: true },
+  client_post_stale_reminder:{ type: Boolean, default: true },
   client_restricted:        { type: Boolean, default: true },
   client_banned:            { type: Boolean, default: true },
 
@@ -19,6 +20,7 @@ const emailSettingsSchema = new mongoose.Schema({
   expert_credits_refunded:  { type: Boolean, default: true },
   expert_approach_sent:     { type: Boolean, default: true },
   expert_new_post:          { type: Boolean, default: true },
+  expert_invite_received:   { type: Boolean, default: true },
   expert_restricted:        { type: Boolean, default: true },
   expert_banned:            { type: Boolean, default: true },
 

@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const multer = require('multer');
 const path = require('path');
-const { protect, authorize } = require('../middleware/auth');
+const { protect, authorize, blockRestrictedUser } = require('../middleware/auth');
 const Document = require('../models/Document');
 const AccessRequest = require('../models/AccessRequest');
 const Approach = require('../models/Approach');
@@ -35,7 +35,7 @@ function getFileType(mimetype, ext) {
 }
 
 // UPLOAD DOCUMENT
-router.post('/upload', protect, upload.single('file'), async (req, res) => {
+router.post('/upload', protect, blockRestrictedUser, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ success: false, message: 'No file uploaded' });
@@ -205,7 +205,7 @@ router.get('/:id', protect, async (req, res) => {
 });
 
 // DELETE DOCUMENT
-router.delete('/:id', protect, async (req, res) => {
+router.delete('/:id', protect, blockRestrictedUser, async (req, res) => {
   try {
     const document = await Document.findById(req.params.id);
     
@@ -227,7 +227,7 @@ router.delete('/:id', protect, async (req, res) => {
 });
 
 // UPDATE DOCUMENT
-router.put('/:id', protect, async (req, res) => {
+router.put('/:id', protect, blockRestrictedUser, async (req, res) => {
   try {
     const { description, category, isPublic } = req.body;
     const document = await Document.findById(req.params.id);
@@ -278,7 +278,7 @@ router.get('/request/:requestId', protect, async (req, res) => {
   }
 });
 // REQUEST ACCESS TO A DOCUMENT
-router.post('/:documentId/request-access', protect, authorize('expert'), async (req, res) => {
+router.post('/:documentId/request-access', protect, authorize('expert'), blockRestrictedUser, async (req, res) => {
   try {
     var documentId = req.params.documentId;
     var message = req.body.message || 'I would like to access this document.';
