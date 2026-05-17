@@ -27,8 +27,11 @@ async function sendStaleReminder(request, now) {
     userId: client._id
   });
 
-  request.staleReminderSentAt = now;
-  await request.save();
+  await Request.updateOne(
+    { _id: request._id },
+    { $set: { staleReminderSentAt: now } },
+    { runValidators: false }
+  );
 
   await logAudit(
     { id: client._id, role: 'client', name: client.name || 'Customer' },
@@ -41,10 +44,17 @@ async function sendStaleReminder(request, now) {
 
 async function purgeRequest(request, now) {
   const client = await User.findById(request.client).select('name').lean();
-  request.status = 'purged';
-  request.purgedAt = now;
-  request.purgeReason = 'No customer confirmation within 3 days after stale reminder';
-  await request.save();
+  await Request.updateOne(
+    { _id: request._id },
+    {
+      $set: {
+        status: 'purged',
+        purgedAt: now,
+        purgeReason: 'No customer confirmation within 3 days after stale reminder'
+      }
+    },
+    { runValidators: false }
+  );
 
   await logAudit(
     { id: request.client, role: 'client', name: client ? client.name : 'Customer' },
