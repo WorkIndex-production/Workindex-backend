@@ -4,6 +4,9 @@ const jwt = require('jsonwebtoken');
 const Admin = require('../models/Admin');
 const { submitUrlsToSearchEngines } = require('../utils/searchIndexing');
 
+const ADSENSE_SNIPPET = '<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-2627739469695660" crossorigin="anonymous"></script>';
+const ADSENSE_META_TAG = '<meta name="google-adsense-account" content="ca-pub-2627739469695660">';
+
 // Reuse admin protect middleware
 const protect = async (req, res, next) => {
   try {
@@ -65,6 +68,7 @@ function generateSeoPage(data) {
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+${ADSENSE_META_TAG}
 <title>${title}</title>
 <meta name="description" content="${metaDescription}"/>
 <meta name="keywords" content="${metaKeywords}"/>
@@ -87,6 +91,7 @@ function generateSeoPage(data) {
   "offers": { "@type": "AggregateOffer", "priceCurrency": "INR", "lowPrice": "${statsPrice.replace(/[^0-9]/g,'')}", "offerCount": "20+" }
 }
 <\/script>
+${ADSENSE_SNIPPET}
 </head>
 <body>
 
